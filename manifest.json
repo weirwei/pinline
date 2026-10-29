@@ -1,0 +1,102 @@
+{
+  "manifest_version": 3,
+  "name": "Pinline",
+  "version": "0.3.0",
+  "description": "Arc-style Favs, Pins and shortcuts for Chrome's native vertical tabs.",
+  "minimum_chrome_version": "123",
+  "permissions": [
+    "tabs",
+    "storage",
+    "contextMenus",
+    "favicon",
+    "bookmarks",
+    "tabGroups"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Pinline: pin / unpin current tab"
+  },
+  "commands": {
+    "toggle-fav": {
+      "description": "设为 / 取消 Fav"
+    },
+    "toggle-pin": {
+      "description": "设为 / 取消 Pin"
+    },
+    "reset-pin": {
+      "description": "回到固定时的网址"
+    },
+    "set-pin-home": {
+      "description": "把当前网址设为固定网址"
+    },
+    "goto-fav-1": {
+      "description": "跳到第 1 个 Fav"
+    },
+    "goto-fav-2": {
+      "description": "跳到第 2 个 Fav"
+    },
+    "goto-fav-3": {
+      "description": "跳到第 3 个 Fav"
+    },
+    "goto-fav-4": {
+      "description": "跳到第 4 个 Fav"
+    },
+    "goto-fav-5": {
+      "description": "跳到第 5 个 Fav"
+    },
+    "goto-fav-6": {
+      "description": "跳到第 6 个 Fav"
+    },
+    "goto-fav-7": {
+      "description": "跳到第 7 个 Fav"
+    },
+    "goto-fav-8": {
+      "description": "跳到第 8 个 Fav"
+    },
+    "goto-fav-9": {
+      "description": "跳到第 9 个 Fav"
+    },
+    "goto-pin-1": {
+      "description": "跳到第 1 个 Pin"
+    },
+    "goto-pin-2": {
+      "description": "跳到第 2 个 Pin"
+    },
+    "goto-pin-3": {
+      "description": "跳到第 3 个 Pin"
+    },
+    "goto-pin-4": {
+      "description": "跳到第 4 个 Pin"
+    },
+    "goto-pin-5": {
+      "description": "跳到第 5 个 Pin"
+    },
+    "goto-pin-6": {
+      "description": "跳到第 6 个 Pin"
+    },
+    "goto-pin-7": {
+      "description": "跳到第 7 个 Pin"
+    },
+    "goto-pin-8": {
+      "description": "跳到第 8 个 Pin"
+    },
+    "goto-pin-9": {
+      "description": "跳到第 9 个 Pin"
+    },
+    "next-space": {
+      "description": "下一个 Space"
+    },
+    "prev-space": {
+      "description": "上一个 Space"
+    },
+    "new-space": {
+      "description": "新建 Space"
+    },
+    "manage-spaces": {
+      "description": "打开 Pinline 面板"
+    }
+  }
+}

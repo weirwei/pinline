@@ -1,0 +1,13 @@
+{
+  "name": "pinline",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Arc-style persistent pins and shortcuts for Chrome's native vertical tabs",
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/",
+    "zip": "rm -f pinline.zip && zip -r pinline.zip manifest.json src -x '*.DS_Store'",
+    "e2e": "node e2e/run.mjs"
+  },
+  "license": "MIT"
+}
