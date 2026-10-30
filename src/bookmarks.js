@@ -49,7 +49,7 @@ const cleanTitle = (t) => String(t ?? '').replace(/\s+/g, ' ').trim().slice(0, 4
  * @returns effects for the caller to apply to tabs
  */
 export function mergeFromBookmarks(model, root, base, trash, newId) {
-  const fx = { removedFavs: [], addedFavs: [], removedPins: [], addedPins: [], movedPins: [] };
+  const fx = { removedFavs: [], addedFavs: [], removedPins: [], addedPins: [], movedPins: [], renamed: [] };
   model.groups ??= [];
   const nodes = base?.nodes ?? {};
   const adopt = Object.keys(nodes).length === 0;
@@ -79,7 +79,11 @@ export function mergeFromBookmarks(model, root, base, trash, newId) {
       // Group membership: the bookmark's folder wins only if the bookmark was moved there.
       if (kind === 'pin' && reparented(node)) it.group = groupId;
       if (changed(node)) {
-        it.title = node.title || it.title;
+        // Renaming the bookmark renames the Fav / Pin; an empty title goes back to the page title.
+        if ((node.title || '') !== (it.name || it.title || it.url)) {
+          it.name = node.title?.trim() || undefined;
+          fx.renamed.push(it.id);
+        }
         it.url = node.url;
       }
       if (kind === 'pin' && it.space !== spaceId) {
@@ -224,13 +228,14 @@ export async function mirrorToBookmarks(model, bm, parentId) {
     return n.id;
   };
   const link = async (item, parent) => {
+    const title = item.name || item.title || item.url;
     const n = await get(item.bm);
     if (!n || !n.url) {
-      item.bm = (await bm.create({ parentId: parent, title: item.title || item.url, url: item.url })).id;
+      item.bm = (await bm.create({ parentId: parent, title, url: item.url })).id;
       return;
     }
     if (n.parentId !== parent) await bm.move(n.id, { parentId: parent });
-    if (n.title !== (item.title || item.url) || n.url !== item.url) await bm.update(n.id, { title: item.title || item.url, url: item.url });
+    if (n.title !== title || n.url !== item.url) await bm.update(n.id, { title, url: item.url });
   };
   // Only ever moves items up, which sidesteps index quirks when moving inside one folder.
   const arrange = async (parent, ids) => {

@@ -59,6 +59,10 @@
     td:last-child { text-align: right; color: var(--muted); }
     td kbd { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--fg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
     tr:last-child td { border-bottom: none; }
+    #names td { text-align: left; color: inherit; }
+    #names td.kind { width: 34px; color: var(--muted); font-size: 12px; }
+    #names input { width: 100%; }
+    #names tr.focus input { outline: 2px solid var(--accent); }
     #status { min-height: 1.5em; color: var(--muted); font-size: 12px; }
   </style>
 </head>
@@ -87,6 +91,16 @@
           <button class="btn danger" id="delete" type="button">删除</button>
         </div>
         <p class="hint" id="current-meta"></p>
+      </section>
+
+      <section class="card" aria-labelledby="names-title">
+        <h1 id="names-title">Fav / Pin 名称</h1>
+        <p class="hint">留空 = 用网页自己的标题。回车保存。</p>
+        <p class="hint" id="perm" hidden>
+          已加载的网页要显示新名字，需要一次「所有网站」权限（脚本只在你改过名的网站上运行，可随时收回）。没有权限时，名字只在休眠时显示。
+          <button class="btn" id="grant" type="button">授权</button>
+        </p>
+        <table><tbody id="names"></tbody></table>
       </section>
 
       <section class="card" aria-labelledby="bm-title">

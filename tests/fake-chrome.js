@@ -99,7 +99,7 @@ function fakeBookmarks() {
   return api;
 }
 
-export function createFakeChrome({ tabs: initialTabs = [], local = {}, sync = {} } = {}) {
+export function createFakeChrome({ tabs: initialTabs = [], local = {}, sync = {}, allSites = false } = {}) {
   let nextId = 1000;
   let nextWindowId = 2;
   const windows = [{ id: 1, type: 'normal', focused: true, incognito: false }];
@@ -187,6 +187,26 @@ export function createFakeChrome({ tabs: initialTabs = [], local = {}, sync = {}
     },
     storage: { local: storageArea(local), sync: storageArea(sync), session: storageArea() },
     bookmarks: fakeBookmarks(),
+    permissions: {
+      granted: allSites,
+      onAdded: event(),
+      onRemoved: event(),
+      contains: async () => chrome.permissions.granted,
+      request: async () => (chrome.permissions.granted = true),
+    },
+    scripting: {
+      registered: [],
+      injected: [],
+      getRegisteredContentScripts: async ({ ids } = {}) => chrome.scripting.registered.filter((r) => !ids || ids.includes(r.id)).map((r) => structuredClone(r)),
+      registerContentScripts: async (defs) => chrome.scripting.registered.push(...structuredClone(defs)),
+      updateContentScripts: async (defs) => {
+        for (const d of defs) Object.assign(chrome.scripting.registered.find((r) => r.id === d.id), structuredClone(d));
+      },
+      unregisterContentScripts: async ({ ids }) => {
+        chrome.scripting.registered = chrome.scripting.registered.filter((r) => !ids.includes(r.id));
+      },
+      executeScript: async ({ target }) => chrome.scripting.injected.push(target.tabId),
+    },
     tabGroups: {
       ...groupEv,
       get: (id) => {
@@ -332,6 +352,11 @@ export function createFakeChrome({ tabs: initialTabs = [], local = {}, sync = {}
           groupsById.delete(tab.groupId);
           if (g) groupEv.onRemoved.emit({ ...g });
         }
+      },
+      messages: [],
+      sendMessage: async (tabId, msg) => {
+        if (!chrome.scripting.injected.includes(tabId)) throw new Error('Could not establish connection. Receiving end does not exist.');
+        chrome.tabs.messages.push([tabId, msg]);
       },
       ungroup: async (ids) => {
         for (const id of [ids].flat()) setGroup(find(id), -1);

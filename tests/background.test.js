@@ -756,3 +756,118 @@ test('import: sub-folders become Pin groups, deeper folders are flattened into t
   assert.deepEqual(await groupView(chrome, bg), ['P(https://a.example.com/)', '[设计]P(https://b.example.com/)', '[设计]P(https://d.example.com/)', '[设计]P(https://c.example.com/)', '|', 'chrome://newtab/']);
   assert.deepEqual(chrome.bookmarks.urls('Pinline', '项目', '设计'), ['https://b.example.com/', 'https://d.example.com/', 'https://c.example.com/']);
 });
+
+// ---------- renaming Favs / Pins ----------
+
+test('rename a pin: bookmark title, sleeping placeholder, content script only on that site', async () => {
+  const { chrome, command, settle, bg } = await setup();
+  await command('toggle-pin', 2);
+  await command('toggle-fav', 1);
+  await bmSettle(settle);
+  const pin = bg.__test.state.pins[0];
+  chrome.permissions.granted = true;
+
+  await message(chrome, settle, { type: 'items:rename', kind: 'pin', id: pin.id, name: '代码' });
+  await bmSettle(settle);
+  assert.equal(bg.__test.state.pins[0].name, '代码');
+  assert.deepEqual(chrome.bookmarks.titles('Pinline', 'Space 1'), ['代码']);
+  assert.deepEqual(chrome.scripting.registered.map((r) => r.matches), [['https://github.com/*']]);
+  assert.deepEqual(chrome.scripting.injected, [2], 'already-loaded page gets the script injected');
+
+  // Closed → re-created asleep with the custom name.
+  await chrome.tabs.remove(2);
+  await settle();
+  const slept = (await chrome.tabs.query({})).find((t) => t.url.startsWith(SLEEP));
+  assert.equal(new URL(slept.url).searchParams.get('title'), '代码');
+
+  // The page asks what it is called.
+  const name = await new Promise((r) => chrome.runtime.onMessage.emit({ type: 'title:get' }, { id: 'fakeid', tab: { id: slept.id } }, r));
+  assert.deepEqual(name, { name: '代码' });
+
+  // Clearing the name: bookmark back to the page title, script unregistered.
+  await message(chrome, settle, { type: 'items:rename', kind: 'pin', id: pin.id, name: '  ' });
+  await bmSettle(settle);
+  assert.equal(bg.__test.state.pins[0].name, undefined);
+  assert.deepEqual(chrome.bookmarks.titles('Pinline', 'Space 1'), [GH]);
+  assert.deepEqual(chrome.scripting.registered, []);
+});
+
+test('without the permission no script is registered, the name still shows while asleep', async () => {
+  const { chrome, command, settle, bg } = await setup();
+  await command('toggle-pin', 2);
+  const pin = bg.__test.state.pins[0];
+  await message(chrome, settle, { type: 'items:rename', kind: 'pin', id: pin.id, name: 'GH' });
+  assert.deepEqual(chrome.scripting.registered, []);
+  assert.deepEqual(chrome.scripting.injected, []);
+  await chrome.tabs.remove(2);
+  await settle();
+  const slept = (await chrome.tabs.query({})).find((t) => t.url.startsWith(SLEEP));
+  assert.equal(new URL(slept.url).searchParams.get('title'), 'GH');
+});
+
+test('renaming the bookmark renames the Fav; a live page is told', async () => {
+  const { chrome, command, settle, bg } = await setup({ allSites: true });
+  await command('toggle-fav', 1);
+  await bmSettle(settle);
+  chrome.scripting.injected.push(1); // the page already runs the script
+  const bmNode = chrome.bookmarks.find('Pinline', '⭐ Fav').children[0];
+  await chrome.bookmarks.update(bmNode.id, { title: '邮件' });
+  await bmSettle(settle);
+  assert.equal(bg.__test.state.favs[0].name, '邮件');
+  assert.deepEqual(chrome.tabs.messages, [[1, { type: 'title:set', name: '邮件' }]]);
+  assert.deepEqual(chrome.scripting.registered[0].matches, ['https://mail.google.com/*']);
+});
+
+test('list for the panel: Favs and the shown Space pins, with names', async () => {
+  const { chrome, command, settle } = await setup();
+  await command('toggle-fav', 1);
+  await command('toggle-pin', 2);
+  const res = await message(chrome, settle, { type: 'spaces:list', windowId: 1 });
+  assert.deepEqual(res.items.map((i) => [i.kind, i.url, i.name]), [['fav', GMAIL, ''], ['pin', GH, '']]);
+  assert.equal(res.canRetitle, false);
+});
+
+// ---------- restart races ----------
+
+test('a pinned tab restored after reconcile binds to its Fav instead of creating a duplicate', async () => {
+  const CT = 'https://ctool.example.com/#/json';
+  const fake = createFakeChrome({
+    local: { favs: [{ id: 'f-gh', url: GH, title: 'GitHub' }, { id: 'f-ct', url: CT, title: 'Ctool' }], pins: [] },
+    tabs: [{ id: 80, url: GH, pinned: true, active: true }], // Ctool not restored yet
+  });
+  const bg = await loadBackground(fake);
+  fake.chrome.runtime.onInstalled.emit({ reason: 'update' });
+  await fake.settle(bg);
+  // Session restore brings Ctool back (live page, title not loaded yet).
+  await fake.chrome.tabs.create({ url: 'https://ctool.example.com/#/xml', pinned: true, active: false });
+  await fake.settle(bg);
+  const { state } = bg.__test;
+  assert.deepEqual(state.favs.map((f) => f.id), ['f-gh', 'f-ct'], 'no new Fav');
+  const pinned = (await fake.chrome.tabs.query({ pinned: true })).map((t) => realUrl(t));
+  assert.equal(pinned.length, 2, `sleeping duplicate closed: ${pinned}`);
+  assert.ok(pinned.includes('https://ctool.example.com/#/xml'), 'the restored live tab is kept');
+});
+
+test('duplicate Favs from an older version are merged on reload', async () => {
+  const fake = createFakeChrome({
+    local: {
+      favs: [
+        { id: 'f-a', url: GH, title: 'GitHub' },
+        { id: 'f-b', url: DOCS, title: 'Docs' },
+        { id: 'f-b2', url: DOCS, title: DOCS, name: '文档' },
+      ],
+      pins: [],
+    },
+    tabs: [
+      { id: 90, url: GH, pinned: true, active: true },
+      { id: 91, url: DOCS, pinned: true },
+      { id: 92, url: `${SLEEP}?url=${encodeURIComponent(DOCS)}&title=x`, pinned: true },
+    ],
+  });
+  const bg = await loadBackground(fake);
+  fake.chrome.runtime.onInstalled.emit({ reason: 'update' });
+  await fake.settle(bg);
+  const { state } = bg.__test;
+  assert.deepEqual(state.favs.map((f) => [f.id, f.name]), [['f-a', undefined], ['f-b', '文档']]);
+  assert.deepEqual((await fake.chrome.tabs.query({ pinned: true })).map((t) => t.id).sort(), [90, 91]);
+});

@@ -160,7 +160,9 @@ function spaceOfWindow(windowId, tabs) {
 const isAsleep = (tab) => tab.discarded || isPlaceholder(tab);
 const canKeep = (tab) => !isDivider(tab) && isPinnableUrl(tabUrl(tab));
 /** URL to open for a sleeping copy: web pages get a placeholder, others the real URL (discarded on load). */
-const sleepingUrl = (item) => (isWakeableUrl(item.url) ? sleepUrl(sleepBase(), item) : item.url);
+/** What a Fav / Pin is called: the user's name for it, else the page title. */
+const displayTitle = (item) => item.name || item.title || item.url;
+const sleepingUrl = (item) => (isWakeableUrl(item.url) ? sleepUrl(sleepBase(), { url: item.url, title: displayTitle(item) }) : item.url);
 
 const originOf = (url) => {
   try {
@@ -210,15 +212,16 @@ function forgetPin(pinId, trash = true) {
   for (const tabId of tabsIn(state.tabToPin, pinId)) delete state.tabToPin[tabId];
 }
 
-/** Bind a tab to the Fav with the same URL (if that Fav has no tab in this window yet), or create a new Fav. */
+/**
+ * Bind a tab to the Fav with the same URL, or create a new Fav. There is one Fav per URL: if the
+ * window already has a copy, layoutFavs() keeps the live one and closes a sleeping duplicate.
+ */
 async function bindOrAddFav(tab) {
   const want = normalizeUrl(tabUrl(tab));
-  for (const fav of state.favs.filter((f) => normalizeUrl(f.url) === want)) {
-    const copies = (await Promise.all(tabsIn(state.tabToFav, fav.id).map(getTab))).filter(Boolean);
-    if (!copies.some((t) => t.windowId === tab.windowId)) {
-      state.tabToFav[tab.id] = fav.id;
-      return fav;
-    }
+  const same = state.favs.find((f) => normalizeUrl(f.url) === want);
+  if (same) {
+    state.tabToFav[tab.id] = same.id;
+    return same;
   }
   const fav = makeItem(crypto.randomUUID(), { ...tab, url: tabUrl(tab) });
   state.favs.push(fav);
@@ -295,6 +298,23 @@ async function layoutFavs(windowId) {
     const cur = await getTab(t.id);
     if (cur && cur.index !== slot) await chrome.tabs.move(cur.id, { index: slot });
     slot++;
+  }
+}
+
+/** Merge Favs with the same URL (left over from older versions / a restart race). */
+function mergeDuplicateFavs() {
+  const seen = new Map();
+  for (const f of [...state.favs]) {
+    const key = normalizeUrl(f.url);
+    const keep = seen.get(key);
+    if (!keep) {
+      seen.set(key, f);
+      continue;
+    }
+    if (f.name && !keep.name) keep.name = f.name;
+    if (f.bm) state.bmTrash.push(f.bm);
+    state.favs = state.favs.filter((x) => x !== f);
+    for (const tabId of tabsIn(state.tabToFav, f.id)) state.tabToFav[tabId] = keep.id;
   }
 }
 
@@ -624,14 +644,23 @@ async function onDividerActivated(divider) {
 }
 const closedAt = {}; // windowId -> when a tab was last closed
 
-/** Show the control panel of a window (optionally with the "new Space" field focused). */
-async function openPanel(windowId, focusNew = false) {
+/** Panel with the name field of this tab's Fav / Pin focused. */
+async function openRename(tab) {
+  const fav = favIdOf(tab.id);
+  const pin = pinIdOf(tab.id);
+  if (!fav && !pin) return;
+  await openPanel(tab.windowId, fav ? `rename=fav:${fav}` : `rename=pin:${pin}`);
+}
+
+/** Show the control panel of a window; `focus` = true / 'rename=…' focuses a field (via the URL hash). */
+async function openPanel(windowId, focus = false) {
   if (!(await isNormalWindow(windowId))) return;
   await layout(windowId);
   const divider = (await windowTabs(windowId)).find(isDivider);
   if (!divider) return;
   const url = rawUrl(divider).split('#')[0];
-  if (focusNew) await chrome.tabs.update(divider.id, { url: `${url}#new` }); // hash only: no reload
+  const hash = focus === true ? 'new' : focus || '';
+  if (hash) await chrome.tabs.update(divider.id, { url: `${url}#${hash}` }); // hash only: no reload
   await chrome.tabs.update(divider.id, { active: true });
   await chrome.windows.update(windowId, { focused: true }).catch(() => {});
 }
@@ -758,6 +787,110 @@ async function deleteSpace(spaceId) {
   await layoutAll(); // with one Space left, dividers drop the name
 }
 
+// ---------- copy URL (Arc's ⌘⇧C) ----------
+
+async function writeClipboard(text) {
+  const url = chrome.runtime.getURL('src/offscreen.html');
+  const has = await chrome.offscreen.hasDocument?.().catch(() => false);
+  if (!has) {
+    await chrome.offscreen
+      .createDocument({ url, reasons: ['CLIPBOARD'], justification: 'Copy the current page URL' })
+      .catch((err) => {
+        if (!/single offscreen/i.test(String(err))) throw err; // already being created
+      });
+  }
+  const res = await chrome.runtime.sendMessage({ type: 'offscreen:copy', text });
+  return !!res?.ok;
+}
+
+/** Copy the tab's URL (the real one for a sleeping placeholder) and flash a ✓ on the toolbar icon. */
+async function copyUrl(tab) {
+  const url = tabUrl(tab);
+  if (!url || isDivider(tab)) return;
+  const ok = await writeClipboard(url).catch(() => false);
+  await chrome.action.setBadgeBackgroundColor({ color: ok ? '#1e8e3e' : '#d93025', tabId: tab.id }).catch(() => {});
+  await chrome.action.setBadgeText({ text: ok ? '✓' : '!', tabId: tab.id }).catch(() => {});
+  await chrome.action.setTitle({ title: ok ? `已复制：${url}` : '复制失败', tabId: tab.id }).catch(() => {});
+  setTimeout(() => {
+    chrome.action.setBadgeText({ text: '', tabId: tab.id }).catch(() => {});
+    chrome.action.setTitle({ title: 'Pinline: pin / unpin current tab', tabId: tab.id }).catch(() => {});
+  }, 1500);
+  return ok;
+}
+
+// ---------- renaming Favs / Pins ----------
+
+const ALL_SITES = { origins: ['<all_urls>'] };
+const RETITLE_ID = 'pinline-retitle';
+const canRetitle = () => chrome.permissions?.contains(ALL_SITES).catch(() => false) ?? false;
+
+/** Run src/retitle.js only on the sites of renamed Favs / Pins (and only with the permission). */
+async function syncRetitleScripts() {
+  if (!chrome.scripting) return;
+  const sites = new Set();
+  if (await canRetitle()) {
+    for (const it of [...state.favs, ...state.pins]) {
+      if (!it.name || !isWakeableUrl(it.url)) continue;
+      const u = new URL(it.url);
+      sites.add(`${u.protocol}//${u.hostname}/*`); // match patterns have no port
+    }
+  }
+  const matches = [...sites].sort();
+  const [existing] = await chrome.scripting.getRegisteredContentScripts({ ids: [RETITLE_ID] }).catch(() => []);
+  if (!matches.length) {
+    if (existing) await chrome.scripting.unregisterContentScripts({ ids: [RETITLE_ID] }).catch(() => {});
+    return;
+  }
+  if (existing && existing.matches?.slice().sort().join() === matches.join()) return;
+  const def = { id: RETITLE_ID, js: ['src/retitle.js'], matches, runAt: 'document_start', persistAcrossSessions: true };
+  if (existing) await chrome.scripting.updateContentScripts([def]);
+  else await chrome.scripting.registerContentScripts([def]);
+}
+
+/** Show an item's (new) name in every tab of it: placeholders are re-rendered, live pages told. */
+async function applyName(item) {
+  const tabIds = [...tabsIn(state.tabToFav, item.id), ...tabsIn(state.tabToPin, item.id)];
+  for (const id of tabIds) {
+    const t = await getTab(id);
+    if (!t) continue;
+    if (isPlaceholder(t)) {
+      await chrome.tabs.update(id, { url: sleepingUrl(item) });
+      pendingDiscard.add(id);
+      continue;
+    }
+    try {
+      await chrome.tabs.sendMessage(id, { type: 'title:set', name: item.name ?? '' });
+    } catch {
+      // Page loaded before the script was registered: inject it now (needs the permission).
+      if (item.name && (await canRetitle())) {
+        await chrome.scripting.executeScript({ target: { tabId: id }, files: ['src/retitle.js'] }).catch(() => {});
+      }
+    }
+  }
+}
+
+const itemByKind = (kind, id) => (kind === 'fav' ? favById(id) : kind === 'pin' ? pinById(id) : null);
+
+/** Rename a Fav / Pin; an empty name goes back to the page's own title. */
+async function renameItem(kind, id, name) {
+  const item = itemByKind(kind, id);
+  if (!item) return;
+  const clean = String(name ?? '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  const next = clean || undefined;
+  if (next === item.name) return;
+  item.name = next;
+  await persist(); // also syncs the bookmark title
+  await syncRetitleScripts();
+  await applyName(item);
+}
+
+/** Favs and the shown Space's Pins, for the panel's name list. */
+async function listItems(windowId) {
+  const spaceId = windowId !== undefined && (await isNormalWindow(windowId)) ? spaceOfWindow(windowId, await windowTabs(windowId)) : null;
+  const view = (kind) => (it) => ({ kind, id: it.id, url: it.url, title: it.title, name: it.name ?? '' });
+  return [...state.favs.map(view('fav')), ...state.pins.filter((p) => p.space === spaceId).map(view('pin'))];
+}
+
 /** Data for the "Manage Spaces" page. */
 async function listSpaces(windowId) {
   const current = windowId !== undefined && (await isNormalWindow(windowId)) ? spaceOfWindow(windowId, await windowTabs(windowId)) : null;
@@ -836,6 +969,8 @@ async function reconcile() {
     missing.push(...r.missing);
   }
 
+  mergeDuplicateFavs();
+
   // Chrome tab groups holding pins (restored by Chrome with new ids): bind them back to Pin groups.
   for (const t of await chrome.tabs.query({})) {
     if (!(t.groupId > -1) || state.groupMap[t.groupId]) continue;
@@ -853,6 +988,7 @@ async function reconcile() {
   }
   await layoutAll();
   await syncBookmarks(); // pick up changes made on other devices while we were not running
+  await syncRetitleScripts();
 }
 
 // ---------- bookmarks ----------
@@ -908,6 +1044,13 @@ async function syncBookmarks() {
 
 /** Make tabs follow what changed in bookmarks. */
 async function applyBookmarkEffects(fx) {
+  if (fx.renamed?.length) {
+    await syncRetitleScripts();
+    for (const id of fx.renamed) {
+      const it = favById(id) ?? pinById(id);
+      if (it) await applyName(it);
+    }
+  }
   for (const favId of fx.removedFavs) await removeFav(favId, undefined, false);
   for (const pinId of [...fx.removedPins, ...fx.movedPins]) {
     for (const tabId of tabsIn(state.tabToPin, pinId)) delete state.tabToPin[tabId]; // the tab stays, as a normal tab
@@ -956,6 +1099,7 @@ const MENU = {
   pin: 'pinline-pin',
   reset: 'pinline-reset',
   home: 'pinline-home',
+  rename: 'pinline-rename',
   newSpace: 'pinline-new-space',
   nextSpace: 'pinline-next-space',
   manageSpaces: 'pinline-manage-spaces',
@@ -968,6 +1112,7 @@ function createMenus() {
       [MENU.pin, '设为 Pin / 取消 Pin'],
       [MENU.reset, '回到固定时的网址'],
       [MENU.home, '把当前网址设为固定网址'],
+      [MENU.rename, '重命名 Fav / Pin…'],
       [MENU.newSpace, '新建 Space…'],
       [MENU.nextSpace, '切到下一个 Space'],
       [MENU.manageSpaces, '打开 Pinline 面板（Space / 设置）'],
@@ -988,6 +1133,21 @@ chrome.runtime.onInstalled.addListener(() => {
   run(reconcile);
 });
 
+/** Session restore adds tabs over a few seconds: wait until the tab count stops changing. */
+async function waitForRestore() {
+  const start = Date.now();
+  let last = -1;
+  let stable = 0;
+  while (Date.now() - start < 15000) {
+    await new Promise((r) => setTimeout(r, 400));
+    const tabs = await chrome.tabs.query({}).catch(() => []);
+    const loading = tabs.filter((t) => !t.url && !t.pendingUrl).length;
+    stable = tabs.length === last && !loading ? stable + 1 : 0;
+    last = tabs.length;
+    if (stable >= 3 && Date.now() - start > 1500) return;
+  }
+}
+
 chrome.runtime.onStartup.addListener(() => {
   run(() => {
     // New browser session: tab and window ids from the last one mean nothing (and may be reused).
@@ -997,8 +1157,8 @@ chrome.runtime.onStartup.addListener(() => {
     state.sleepers = {};
     state.groupMap = {};
   });
-  // Give Chrome a moment to restore the session before deciding what is missing.
-  run(() => new Promise((r) => setTimeout(r, 1500)).then(reconcile));
+  // Wait until Chrome has restored the session before deciding what is missing.
+  run(() => waitForRestore().then(reconcile));
 });
 
 chrome.windows.onCreated.addListener((win) => {
@@ -1009,6 +1169,9 @@ chrome.windows.onCreated.addListener((win) => {
 chrome.tabs.onCreated.addListener((tab) => {
   run(async () => {
     if (selfCreated.delete(tab.id) || !state.ready) return;
+    const cur = await getTab(tab.id); // the event's snapshot may be stale by now
+    if (!cur || favIdOf(cur.id) || pinIdOf(cur.id)) return;
+    tab = cur;
     if (!(await isNormalWindow(tab.windowId))) return;
     if (tab.pinned) return makeFav(tab);
     // New tabs never start out as Pins: a link opened from a Fav/Pin lands above the line, move it below.
@@ -1110,13 +1273,28 @@ for (const name of ['onCreated', 'onRemoved', 'onChanged', 'onMoved', 'onChildre
   });
 }
 
+chrome.permissions?.onAdded.addListener(() => run(async () => {
+  await syncRetitleScripts();
+  for (const it of [...state.favs, ...state.pins]) if (it.name) await applyName(it);
+}));
+chrome.permissions?.onRemoved.addListener(() => run(syncRetitleScripts));
+
 // Requests from the "Manage Spaces" page (extension pages only).
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (sender.id !== chrome.runtime.id || !msg?.type?.startsWith('spaces:')) return;
+  if (sender.id !== chrome.runtime.id) return;
+  // From src/retitle.js in a page: what should this tab be called?
+  if (msg?.type === 'title:get' && sender.tab) {
+    const id = sender.tab.id;
+    sendResponse({ name: (favById(state.tabToFav[id]) ?? pinById(state.tabToPin[id]))?.name ?? null });
+    return;
+  }
+  if (!msg?.type?.startsWith('spaces:') && !msg?.type?.startsWith('items:')) return;
+  if (sender.tab && !sender.url?.startsWith(chrome.runtime.getURL(''))) return; // extension pages only
   const windowId = Number.isInteger(msg.windowId) ? msg.windowId : undefined;
   let result;
   run(async () => {
     if (msg.type === 'spaces:rename') await renameSpace(msg.id, msg.name);
+    if (msg.type === 'items:rename') await renameItem(msg.kind, msg.id, msg.name);
     if (msg.type === 'spaces:delete') await deleteSpace(msg.id);
     if (msg.type === 'spaces:new') await newSpace(windowId, msg.name);
     if (msg.type === 'spaces:suggest') return void (result = { name: defaultSpaceName() });
@@ -1125,7 +1303,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await switchSpace(windowId, msg.id);
       await chrome.windows.update(windowId, { focused: true }).catch(() => {});
     }
-    result = { spaces: await listSpaces(windowId), bookmarkRoot: state.bm.root ?? null };
+    result = {
+      spaces: await listSpaces(windowId),
+      items: await listItems(windowId),
+      canRetitle: await canRetitle(),
+      bookmarkRoot: state.bm.root ?? null,
+    };
   }).then(() => sendResponse(result ?? { error: 'failed' }));
   return true; // respond asynchronously
 });
@@ -1138,6 +1321,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === MENU.pin) run(() => togglePin(tab));
   if (info.menuItemId === MENU.reset) run(() => resetToHome(tab));
   if (info.menuItemId === MENU.home) run(() => setHome(tab));
+  if (info.menuItemId === MENU.rename) run(() => openRename(tab));
   if (info.menuItemId === MENU.newSpace) run(() => openPanel(tab.windowId, true));
   if (info.menuItemId === MENU.nextSpace) run(() => switchSpace(tab.windowId, 1));
   if (info.menuItemId === MENU.manageSpaces) run(() => openPanel(tab.windowId));
@@ -1147,6 +1331,7 @@ chrome.commands.onCommand.addListener((command, tab) => {
   run(async () => {
     tab ??= (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0];
     if (!tab) return;
+    if (command === 'copy-url') return copyUrl(tab);
     if (command === 'toggle-fav') return toggleFav(tab);
     if (command === 'toggle-pin') return togglePin(tab);
     if (command === 'reset-pin') return resetToHome(tab);
@@ -1174,5 +1359,7 @@ globalThis.pinline = {
   renameSpace: (id, name) => run(() => renameSpace(id, name)),
   deleteSpace: (id) => run(() => deleteSpace(id)),
   openPanel: (windowId, focusNew) => run(() => openPanel(windowId, focusNew)),
+  renameItem: (kind, id, name) => run(() => renameItem(kind, id, name)),
+  copyUrl: async (tabId) => copyUrl(await chrome.tabs.get(tabId)),
   syncBookmarks: () => run(syncBookmarks),
 };

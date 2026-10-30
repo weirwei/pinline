@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pinline",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Arc-style Favs, Pins and shortcuts for Chrome's native vertical tabs.",
   "minimum_chrome_version": "123",
   "permissions": [
@@ -10,7 +10,10 @@
     "contextMenus",
     "favicon",
     "bookmarks",
-    "tabGroups"
+    "tabGroups",
+    "scripting",
+    "offscreen",
+    "clipboardWrite"
   ],
   "background": {
     "service_worker": "src/background.js",
@@ -20,6 +23,13 @@
     "default_title": "Pinline: pin / unpin current tab"
   },
   "commands": {
+    "copy-url": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+C",
+        "mac": "Command+Shift+C"
+      },
+      "description": "复制当前页面网址"
+    },
     "toggle-fav": {
       "description": "设为 / 取消 Fav"
     },
@@ -98,5 +108,8 @@
     "manage-spaces": {
       "description": "打开 Pinline 面板"
     }
-  }
+  },
+  "optional_host_permissions": [
+    "<all_urls>"
+  ]
 }
