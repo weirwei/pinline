@@ -1185,3 +1185,33 @@ test('MRU list survives a service worker restart (storage.session)', async () =>
   const bg2 = await loadBackground(fake); // a second copy loads state like a woken-up worker
   assert.deepEqual(bg2.__test.state.mru[1].slice(0, 2), [3, 2]);
 });
+
+test('switching into a Space collapses its Pin groups, except the one holding the shown tab', async () => {
+  const { chrome, command, settle } = await setup();
+  await command('toggle-pin', 2);
+  await command('toggle-pin', 3);
+  await pinsInGroup(chrome, command, settle, 'A', 2, 3);
+  // A second group, holding the tab that will be shown on return.
+  await command('toggle-pin', 1);
+  const gB = await chrome.tabs.group({ tabIds: [1] });
+  await chrome.tabGroups.update(gB, { title: 'B' });
+  await chrome.tabs.update(1, { active: true });
+  await settle();
+  globalThis.pinline.newSpace(1);
+  await settle();
+  globalThis.pinline.switchSpace(1, -1);
+  await settle();
+  const groups = Object.fromEntries((await chrome.tabGroups.query({})).map((g) => [g.title, g.collapsed]));
+  assert.deepEqual(groups, { A: true, B: false });
+
+  // Turned off: groups keep whatever state they had.
+  await message(chrome, settle, { type: 'settings:set', collapseGroupsOnSwitch: false });
+  const gA = (await chrome.tabGroups.query({})).find((g) => g.title === 'A');
+  await chrome.tabGroups.update(gA.id, { collapsed: false });
+  await settle();
+  globalThis.pinline.switchSpace(1, 1);
+  await settle();
+  globalThis.pinline.switchSpace(1, -1);
+  await settle();
+  assert.equal((await chrome.tabGroups.query({})).find((g) => g.title === 'A').collapsed, false);
+});

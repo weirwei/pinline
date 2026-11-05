@@ -380,13 +380,15 @@ export function createFakeChrome({ tabs: initialTabs = [], local = {}, sync = {}
         }
         const g = groupsById.get(gid);
         const anchor = order[g.windowId].find((t) => t.groupId === gid) ?? list[0];
-        let at = order[g.windowId].indexOf(anchor);
-        for (const t of list) {
+        // Like Chrome: the group sits where its first (existing) tab is; added tabs follow it.
+        const w = order[g.windowId];
+        const members = list.filter((t) => t !== anchor);
+        if (!anchor.groupId || anchor.groupId < 0 || anchor.groupId === gid) setGroup(anchor, gid);
+        for (const t of members) w.splice(w.indexOf(t), 1);
+        let at = w.lastIndexOf(w.filter((t) => t.groupId === gid).at(-1) ?? anchor);
+        for (const t of members) {
           setGroup(t, gid);
-          const cur = order[t.windowId].indexOf(t);
-          order[t.windowId].splice(cur, 1);
-          if (cur < at) at--;
-          order[t.windowId].splice(++at > order[t.windowId].length ? order[t.windowId].length : at, 0, t);
+          w.splice(++at, 0, t);
         }
         compact(g.windowId);
         return gid;

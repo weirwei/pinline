@@ -285,6 +285,7 @@ function showArchive(res) {
   if (!res) return;
   archive = res.archive ?? [];
   if (document.activeElement !== $('archive-after')) $('archive-after').value = String(res.settings?.archiveAfterHours ?? 0);
+  $('collapse-groups').checked = res.settings?.collapseGroupsOnSwitch !== false;
   renderArchive();
 }
 
@@ -319,6 +320,11 @@ function renderArchive() {
 const refreshArchive = async () => showArchive(await send({ type: 'archive:list' }));
 
 $('archive-search').addEventListener('input', renderArchive);
+$('collapse-groups').addEventListener('change', async () => {
+  const on = $('collapse-groups').checked;
+  showArchive(await send({ type: 'settings:set', collapseGroupsOnSwitch: on }));
+  say(on ? '切换 Space 时会收起 Pin 分组' : '切换 Space 时保持分组原来的展开状态');
+});
 $('archive-after').addEventListener('change', async () => {
   const hours = Number($('archive-after').value);
   showArchive(await send({ type: 'settings:set', archiveAfterHours: hours }));

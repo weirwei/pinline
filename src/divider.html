@@ -77,6 +77,7 @@
     .x { border: none; background: transparent; color: var(--muted); font-size: 16px; line-height: 1; padding: 4px 8px; border-radius: 6px; cursor: pointer; }
     .x:hover { color: var(--danger); background: var(--bg); }
     #archive .empty { color: var(--muted); font-size: 13px; padding: 6px 0; display: block; border: none; }
+    label.check { display: flex; gap: 6px; align-items: center; font-size: 13px; margin: 4px 0 0; cursor: pointer; }
     #status { min-height: 1.5em; color: var(--muted); font-size: 12px; }
   </style>
 </head>
@@ -90,6 +91,7 @@
           <input id="new-name" maxlength="40" autocomplete="off" aria-label="新 Space 名称">
           <button class="btn primary" type="submit">新建</button>
         </form>
+        <label class="check"><input type="checkbox" id="collapse-groups"> 切换 Space 时收起 Pin 分组</label>
         <p class="hint">点一下选中（右边可改名 / 删除），点「切换」或双击切过去。键盘：1–9 选中，回车切换。新建会直接切过去。</p>
       </section>
       <div id="status" role="status" aria-live="polite"></div>

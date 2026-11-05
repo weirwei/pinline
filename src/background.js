@@ -57,7 +57,7 @@ const state = {
   spaceActive: {}, // spaceId -> what was selected: { pin: pinId } | { tab: index into spaceTabs }
   lastSeen: {}, // tabId -> when the tab was last selected (ms), for auto-archive
   archive: [], // archived tabs, newest first [{ id, url, title, favIconUrl?, spaceId, archivedAt }]
-  settings: { archiveAfterHours: 0 }, // 0 = auto-archive off
+  settings: { archiveAfterHours: 0, collapseGroupsOnSwitch: true }, // 0 = auto-archive off
   mru: {}, // windowId -> tab ids, most recently used first (storage.session)
   ready: false, // set once this browser session has been reconciled; until then never create tabs
 };
@@ -398,6 +398,12 @@ async function layoutPins(windowId) {
 
   // What it should look like.
   tabs = await windowTabs(windowId);
+  // A tab group the user just made around pins, not seen by syncFromPositions yet: adopt it, so it
+  // is not taken for a stray group and ungrouped.
+  for (const t of tabs) {
+    const pin = pinById(pinIdOf(t.id));
+    if (pin && !t.pinned && t.groupId > -1 && !state.groupMap[t.groupId]) pin.group = await adoptChromeGroup(t.groupId, space.id);
+  }
   const tabOf = new Map();
   for (const t of tabs) {
     const pinId = pinIdOf(t.id);
@@ -751,6 +757,10 @@ async function switchSpace(windowId, target) {
   const items = state.spaceTabs[targetId] ?? [];
   const showPin = pins.find((p) => p.id === want?.pin);
   const showTab = !showPin && items.length ? Math.min(want?.tab ?? 0, items.length - 1) : -1;
+  // Arrive with the Space's Pin groups collapsed (Chrome can't collapse the group of the shown tab).
+  if (state.settings.collapseGroupsOnSwitch) {
+    for (const g of state.groups.filter((g) => g.space === targetId)) g.collapsed = showPin?.group !== g.id;
+  }
   const open = async (item, isShown) => {
     const tab = await createSelf({ windowId, url: isShown ? item.url : sleepingUrl(item), active: isShown });
     if (!isShown) pendingDiscard.add(tab.id);
@@ -1611,7 +1621,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'spaces:new') await newSpace(windowId, msg.name);
     if (msg.type === 'spaces:suggest') return void (result = { name: defaultSpaceName() });
     if (/^(archive|settings):/.test(msg.type)) {
-      if (msg.type === 'settings:set') await setArchiveAfter(msg.archiveAfterHours);
+      if (msg.type === 'settings:set' && 'archiveAfterHours' in msg) await setArchiveAfter(msg.archiveAfterHours);
+      if (msg.type === 'settings:set' && typeof msg.collapseGroupsOnSwitch === 'boolean') {
+        state.settings = { ...state.settings, collapseGroupsOnSwitch: msg.collapseGroupsOnSwitch };
+        await chrome.storage.local.set({ settings: state.settings });
+      }
       if (msg.type === 'archive:open' && windowId !== undefined) await openArchived(msg.id, windowId);
       if (msg.type === 'archive:delete') await deleteArchived(msg.id);
       if (msg.type === 'archive:clear') await clearArchive();
