@@ -871,3 +871,27 @@ test('duplicate Favs from an older version are merged on reload', async () => {
   assert.deepEqual(state.favs.map((f) => [f.id, f.name]), [['f-a', undefined], ['f-b', '文档']]);
   assert.deepEqual((await fake.chrome.tabs.query({ pinned: true })).map((t) => t.id).sort(), [90, 91]);
 });
+
+// ---------- closing pins with extra bindings ----------
+
+test('closing a pin re-creates it even if a stale binding to a gone tab is left', async () => {
+  const { chrome, command, settle, strip, bg } = await setup();
+  await command('toggle-pin', 2);
+  bg.__test.state.tabToPin[99999] = bg.__test.state.pins[0].id; // stale id, tab does not exist
+  await chrome.tabs.remove(2);
+  await settle();
+  assert.deepEqual(await strip(), [`Pzz(${GH})`, '|', GMAIL, DOCS]);
+});
+
+test('closing a pin re-creates it even if another window shows the same pin', async () => {
+  const { chrome, command, settle, strip, bg } = await setup({
+    tabs: [{ id: 1, url: GMAIL, active: true }, { id: 2, url: GH }, { id: 3, url: DOCS, windowId: 2, active: true }],
+  });
+  await command('toggle-pin', 2);
+  const other = await chrome.tabs.create({ windowId: 2, url: GH, active: false });
+  await settle();
+  bg.__test.state.tabToPin[other.id] = bg.__test.state.pins[0].id; // same Space shown in window 2 too
+  await chrome.tabs.remove(2);
+  await settle();
+  assert.deepEqual(await strip(1), [`Pzz(${GH})`, '|', GMAIL]);
+});

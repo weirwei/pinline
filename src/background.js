@@ -1215,7 +1215,17 @@ chrome.tabs.onRemoved.addListener((tabId, { windowId, isWindowClosing }) => {
     if (pinId) {
       delete state.tabToPin[tabId];
       const pin = pinById(pinId);
-      if (!isWindowClosing && pin && tabsIn(state.tabToPin, pinId).length === 0) await recreatePin(pin, windowId);
+      // Re-create unless this window still has a live tab of it. Other windows (the same Space shown
+      // twice) and stale ids left behind must not keep a closed pin from coming back.
+      if (!isWindowClosing && pin) {
+        let stillHere = false;
+        for (const id of tabsIn(state.tabToPin, pinId)) {
+          // Missing tabs are only ignored, not unbound: a tab being discarded briefly has no id.
+          const t = await getTab(id);
+          if (t?.windowId === windowId) stillHere = true;
+        }
+        if (!stillHere) await recreatePin(pin, windowId);
+      }
     }
     // Window closing: keep everything, reconcile() re-binds next start. Otherwise re-open what was closed.
     if (isWindowClosing) await persist();
