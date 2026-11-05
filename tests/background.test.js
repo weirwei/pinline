@@ -895,3 +895,71 @@ test('closing a pin re-creates it even if another window shows the same pin', as
   await settle();
   assert.deepEqual(await strip(1), [`Pzz(${GH})`, '|', GMAIL]);
 });
+
+// ---------- review fixes ----------
+
+test('two tiles of the same Fav in one window do not lose another Fav when reordering', async () => {
+  const { chrome, command, settle, bg } = await setup();
+  await command('toggle-fav', 1);
+  await command('toggle-fav', 2);
+  const extra = await chrome.tabs.create({ url: GMAIL, pinned: true, active: false });
+  bg.__test.state.tabToFav[extra.id] = bg.__test.state.favs[0].id; // e.g. dragged in from another window
+  await chrome.tabs.move(extra.id, { index: 1 });
+  await settle();
+  assert.deepEqual(bg.__test.state.favs.map((f) => f.url), [GMAIL, GH]);
+  assert.ok(bg.__test.state.favs.every(Boolean));
+});
+
+test('a second copy of a Pin in one window is dropped without deleting the Pin', async () => {
+  const { chrome, command, settle, strip, bg } = await setup();
+  await command('toggle-pin', 2);
+  const copy = await chrome.tabs.create({ url: `${SLEEP}?url=${encodeURIComponent(GH)}&title=x`, index: 0, active: false });
+  bg.__test.state.tabToPin[copy.id] = bg.__test.state.pins[0].id;
+  await chrome.tabs.move(copy.id, { index: 1 }); // triggers a layout
+  await settle();
+  assert.equal(bg.__test.state.pins.length, 1, 'pin kept');
+  assert.deepEqual(await strip(), [`P(${GH})`, '|', GMAIL, DOCS]);
+});
+
+test('goto-pin-N counts pins of the shown Space only', async () => {
+  const { chrome, command, settle } = await setup();
+  await command('toggle-pin', 2); // Space 1
+  globalThis.pinline.newSpace(1);
+  await settle();
+  const t = await chrome.tabs.create({ url: 'https://s2.example.com/', windowId: 1 });
+  await settle();
+  await command('toggle-pin', t.id);
+  await command('goto-pin-1', t.id);
+  const [active] = await chrome.tabs.query({ active: true, windowId: 1 });
+  assert.equal(realUrl(active), 'https://s2.example.com/');
+  assert.ok(!(await chrome.tabs.query({})).some((x) => realUrl(x) === GH), 'no Space 1 pin opened here');
+});
+
+test('javascript: bookmarks in a Space folder are never turned into pins', async () => {
+  const { chrome, command, settle, bg } = await setup();
+  await command('toggle-pin', 2);
+  await bmSettle(settle);
+  await chrome.bookmarks.create({ parentId: chrome.bookmarks.find('Pinline', 'Space 1').id, title: 'evil', url: 'javascript:alert(1)' });
+  await bmSettle(settle);
+  assert.deepEqual(bg.__test.state.pins.map((p) => p.url), [GH]);
+});
+
+test('title:get waits for state to load (cold service worker)', async () => {
+  const fake = createFakeChrome({
+    local: { pins: [{ id: 'p', url: GH, title: 'GitHub', name: '代码', space: 's' }], spaces: [{ id: 's', name: 'S' }], tabs: { tabToPin: { 7: 'p' } } },
+    tabs: [{ id: 7, url: GH, active: true }],
+  });
+  globalThis.chrome = fake.chrome;
+  const bg = await import(`../src/background.js?cold=${Math.random()}`);
+  const res = await new Promise((r) => fake.chrome.runtime.onMessage.emit({ type: 'title:get' }, { id: 'fakeid', tab: { id: 7 } }, r));
+  assert.deepEqual(res, { name: '代码' });
+  await fake.settle(bg);
+});
+
+test('a Chrome update (onInstalled + onStartup) reconciles only once, after restore', async () => {
+  const fake = createFakeChrome({ tabs: [{ id: 1, url: GMAIL, active: true }] });
+  const bg = await loadBackground(fake);
+  fake.chrome.runtime.onInstalled.emit({ reason: 'chrome_update' });
+  await fake.settle(bg);
+  assert.equal(bg.__test.state.ready, false, 'onInstalled(chrome_update) does not reconcile');
+});

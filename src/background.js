@@ -11,7 +11,7 @@
 // Favs and Pins are persistent: closing one re-creates it asleep at its home URL, in its slot.
 // - right-click → Pin (native) makes a tab a Fav; right-click → Unpin removes the Fav everywhere;
 // - dragging a tab above the divider makes it a Pin, dragging a Pin below the divider unpins it;
-// - Favs and Pins survive restarts and sync via chrome.storage.sync.
+// - Favs and Pins survive restarts (chrome.storage.local) and sync across devices via bookmarks.
 
 import {
   DIVIDER_PAGE,
@@ -27,6 +27,8 @@ import {
   parseSleepUrl,
   sleepUrl,
   displayOrder,
+  isOpenableUrl,
+  uniqueOrder,
 } from './core.js';
 import { ROOT_TITLE, mergeFromBookmarks, mirrorToBookmarks, snapshot } from './bookmarks.js';
 
@@ -131,8 +133,10 @@ const tabsIn = (map, id) =>
     .filter((k) => map[k] === id)
     .map(Number);
 
-const sleepBase = () => chrome.runtime.getURL(SLEEP_PAGE);
-const dividerUrl = () => chrome.runtime.getURL(DIVIDER_PAGE);
+let sleepBaseUrl;
+const sleepBase = () => (sleepBaseUrl ??= chrome.runtime.getURL(SLEEP_PAGE));
+let dividerBaseUrl;
+const dividerUrl = () => (dividerBaseUrl ??= chrome.runtime.getURL(DIVIDER_PAGE));
 const rawUrl = (tab) => tab.url || tab.pendingUrl || '';
 /** The page a tab stands for: a sleeping placeholder counts as the site it will wake up to. */
 const tabUrl = (tab) => parseSleepUrl(sleepBase(), rawUrl(tab)) ?? rawUrl(tab);
@@ -381,7 +385,23 @@ async function layoutPins(windowId) {
   // What it should look like.
   tabs = await windowTabs(windowId);
   const tabOf = new Map();
-  for (const t of tabs) if (pinIdOf(t.id) && !t.pinned && !tabOf.has(pinIdOf(t.id))) tabOf.set(pinIdOf(t.id), t);
+  for (const t of tabs) {
+    const pinId = pinIdOf(t.id);
+    if (!pinId || t.pinned) continue;
+    const first = tabOf.get(pinId);
+    if (!first) {
+      tabOf.set(pinId, t);
+      continue;
+    }
+    // Two tabs of one Pin in this window: keep the live one, drop / unbind the other.
+    const drop = isAsleep(t) || !isAsleep(first) ? t : first;
+    if (drop === first) tabOf.set(pinId, t);
+    delete state.tabToPin[drop.id];
+    if (isAsleep(drop)) {
+      switchClosing.add(drop.id); // closing it must not re-create the pin
+      await chrome.tabs.remove(drop.id).catch(() => switchClosing.delete(drop.id));
+    }
+  }
   const present = state.pins.filter((p) => tabOf.has(p.id));
   const plan = displayOrder(present, state.groups).filter((x) => x.pin || x.pins.length);
   const want = plan.flatMap((x) => (x.pin ? [[tabOf.get(x.pin.id).id, null]] : x.pins.map((p) => [tabOf.get(p.id).id, x.group.id])));
@@ -468,7 +488,7 @@ async function syncFromPositions(windowId) {
   const tabs = await windowTabs(windowId);
 
   // Fav order as dragged in this window → applied to every window.
-  const favOrder = tabs.filter((t) => t.pinned && favIdOf(t.id)).map((t) => favIdOf(t.id));
+  const favOrder = uniqueOrder(tabs.filter((t) => t.pinned && favIdOf(t.id)).map((t) => favIdOf(t.id)), favById);
   const before = state.favs.map((f) => f.id).join();
   const present = new Set(favOrder);
   let i = 0;
@@ -480,7 +500,13 @@ async function syncFromPositions(windowId) {
   if (d >= 0) {
     const above = tabs.slice(0, d).filter((t) => !t.pinned && !favIdOf(t.id) && !pendingUnpin.has(t.id));
     const groupsBefore = usedGroups();
-    for (const t of tabs.slice(d + 1)) if (pinIdOf(t.id)) forgetPin(pinIdOf(t.id));
+    const keptAbove = new Set(above.map((t) => pinIdOf(t.id)).filter(Boolean));
+    for (const t of tabs.slice(d + 1)) {
+      const pinId = pinIdOf(t.id);
+      if (!pinId) continue;
+      if (keptAbove.has(pinId)) delete state.tabToPin[t.id]; // a stray second copy: just unbind it
+      else forgetPin(pinId);
+    }
     for (const t of above) if (!pinIdOf(t.id) && canKeep(t)) addPin(t, spaceId);
     // Group membership as arranged by the user (drag into / out of a group, "Add to new group"...).
     for (const t of above) {
@@ -490,7 +516,7 @@ async function syncFromPositions(windowId) {
       else pin.group = state.groupMap[t.groupId] ?? (await adoptChromeGroup(t.groupId, spaceId));
     }
     dropEmptyGroups(groupsBefore);
-    const pinOrder = above.map((t) => pinIdOf(t.id)).filter(Boolean);
+    const pinOrder = uniqueOrder(above.map((t) => pinIdOf(t.id)), pinById);
     const set = new Set(pinOrder);
     let j = 0;
     state.pins = state.pins.map((p) => (set.has(p.id) ? pinById(pinOrder[j++]) : p));
@@ -590,7 +616,7 @@ const itemOf = (tab) => favById(favIdOf(tab.id)) ?? pinById(pinIdOf(tab.id));
 
 async function resetToHome(tab) {
   const item = itemOf(tab);
-  if (item && normalizeUrl(tabUrl(tab)) !== normalizeUrl(item.url)) await chrome.tabs.update(tab.id, { url: item.url });
+  if (item && isOpenableUrl(item.url) && normalizeUrl(tabUrl(tab)) !== normalizeUrl(item.url)) await chrome.tabs.update(tab.id, { url: item.url });
 }
 
 async function setHome(tab) {
@@ -616,11 +642,16 @@ async function gotoFav(n, windowId) {
 }
 
 async function gotoPin(n, windowId) {
-  const pin = state.pins[n - 1];
+  if (!(await isNormalWindow(windowId))) return;
+  const spaceId = spaceOfWindow(windowId, await windowTabs(windowId));
+  const ordered = displayOrder(state.pins.filter((p) => p.space === spaceId), state.groups.filter((g) => g.space === spaceId))
+    .flatMap((x) => (x.pin ? [x.pin] : x.pins));
+  const pin = ordered[n - 1];
   if (!pin) return;
   const copies = (await Promise.all(tabsIn(state.tabToPin, pin.id).map(getTab))).filter(Boolean);
   const target = copies.find((t) => t.windowId === windowId) ?? copies[0];
   if (target) return activate(target);
+  if (!isOpenableUrl(pin.url)) return;
   const index = await pinSlot(pin, windowId);
   const tab = await createSelf({ windowId, url: pin.url, active: true, index });
   state.tabToPin[tab.id] = pin.id;
@@ -632,7 +663,6 @@ async function gotoPin(n, windowId) {
  * selects it by itself right after a Space switch or after closing the tab next to it: then move on.
  */
 async function onDividerActivated(divider) {
-  await new Promise((r) => setTimeout(r, 150)); // let a matching onRemoved arrive first
   const byChrome = Date.now() < switchingUntil || Date.now() - (closedAt[divider.windowId] ?? 0) < 600;
   if (!byChrome) return;
   const cur = await getTab(divider.id);
@@ -724,14 +754,16 @@ async function switchSpace(windowId, target) {
   delete state.spaceTabs[targetId];
 
   // 3. Close the old Space's tabs (its pins are saved in state.pins, they come back next time).
+  // Saved first: if the browser dies between the two steps the tabs are not lost.
+  await chrome.storage.local.set({ spaceTabs: state.spaceTabs, spaceActive: state.spaceActive });
   for (const t of outgoing) {
     delete state.tabToPin[t.id];
     delete state.sleepers[t.id];
     switchClosing.add(t.id);
   }
-  await chrome.tabs.remove(outgoing.map((t) => t.id)).catch(() => {});
-
-  await chrome.storage.local.set({ spaceTabs: state.spaceTabs, spaceActive: state.spaceActive });
+  await chrome.tabs.remove(outgoing.map((t) => t.id)).catch(async () => {
+    for (const t of outgoing) await chrome.tabs.remove(t.id).catch(() => switchClosing.delete(t.id));
+  });
   await layout(windowId);
   switchingUntil = Date.now() + SWITCH_GRACE_MS;
 }
@@ -1019,7 +1051,7 @@ async function syncBookmarks() {
     if (!root || root.url) {
       // First run, reinstall, or the folder was deleted. Adopt a "Pinline" folder if there is one
       // (e.g. synced from another device), otherwise it is re-created from Pinline's state below.
-      for (const it of [...state.favs, ...state.pins, ...state.spaces]) it.bm = undefined;
+      for (const it of [...state.favs, ...state.pins, ...state.spaces, ...state.groups]) it.bm = undefined;
       state.bm = {};
       base = { nodes: {}, order: {} };
       const found = (await chrome.bookmarks.getChildren(parentId)).find((n) => !n.url && n.title === ROOT_TITLE);
@@ -1073,6 +1105,7 @@ async function importFolderAsSpace(folderId, windowId) {
   state.spaces.push(space);
   const addLink = (n, group) => state.pins.push({ ...makeItem(crypto.randomUUID(), { url: n.url, title: n.title }), space: space.id, group });
   for (const n of children) {
+    if (n.url && !isOpenableUrl(n.url)) continue;
     if (n.url) {
       addLink(n);
       continue;
@@ -1080,7 +1113,7 @@ async function importFolderAsSpace(folderId, windowId) {
     // Each sub-folder becomes a Pin group; folders deeper inside it are flattened into that group.
     const [tree] = await chrome.bookmarks.getSubTree(n.id);
     const links = [];
-    const collect = (node) => (node.children ?? []).forEach((c) => (c.url ? links.push(c) : collect(c)));
+    const collect = (node) => (node.children ?? []).forEach((c) => (c.url ? isOpenableUrl(c.url) && links.push(c) : collect(c)));
     collect(tree);
     if (!links.length) continue;
     const group = { id: crypto.randomUUID(), space: space.id, title: cleanName(n.title), color: 'grey', collapsed: false };
@@ -1128,9 +1161,10 @@ function createMenus() {
 
 // ---------- event wiring (registered synchronously at top level, as MV3 requires) ----------
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener(({ reason }) => {
   createMenus();
-  run(reconcile);
+  // A Chrome update also fires onStartup, which reconciles after session restore: don't race it.
+  if (reason !== 'chrome_update' && reason !== 'shared_module_update') run(reconcile);
 });
 
 /** Session restore adds tabs over a few seconds: wait until the tab count stops changing. */
@@ -1190,7 +1224,7 @@ chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
       }
     }
     if (state.sleepers[tabId] && info.url && !isPlaceholder(tab)) delete state.sleepers[tabId]; // woke up
-    if ('groupId' in info && state.ready) await syncFromPositions(tab.windowId); // dragged into / out of a group
+    if ('groupId' in info && state.ready) queueSync(tab.windowId); // dragged into / out of a group
     if (pendingDiscard.has(tabId) && isPlaceholder(tab)) {
       // Wait for the favicon so the sleeping tab keeps its icon; fall back after a second.
       if (info.favIconUrl) await sleepTab(tabId);
@@ -1258,15 +1292,30 @@ chrome.tabs.onReplaced.addListener((addedId, removedId) => {
   });
 });
 
-chrome.tabs.onMoved.addListener((_tabId, { windowId }) => run(() => syncFromPositions(windowId)));
-chrome.tabs.onAttached.addListener((_tabId, { newWindowId }) => run(() => syncFromPositions(newWindowId)));
+/**
+ * Re-read a window's arrangement once per burst of move / group events. Our own layout moves fire
+ * these events too; while a sync for the window is already queued, more events add nothing.
+ */
+const syncQueued = new Set();
+function queueSync(windowId) {
+  if (syncQueued.has(windowId)) return;
+  syncQueued.add(windowId);
+  run(async () => {
+    syncQueued.delete(windowId);
+    if (state.ready) await syncFromPositions(windowId);
+  });
+}
+
+chrome.tabs.onMoved.addListener((_tabId, { windowId }) => queueSync(windowId));
+chrome.tabs.onAttached.addListener((_tabId, { newWindowId }) => queueSync(newWindowId));
 chrome.tabs.onDetached.addListener((_tabId, { oldWindowId }) => run(() => layout(oldWindowId)));
 
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   run(async () => {
     const tab = await getTab(tabId);
     if (!tab) return;
-    if (isDivider(tab)) return onDividerActivated(tab);
+    // Wait outside the queue so a matching onRemoved can arrive first without blocking other events.
+    if (isDivider(tab)) return void setTimeout(() => run(() => onDividerActivated(tab)), 150);
     lastActive[windowId] = tabId;
     // Wake a sleeping placeholder right away (its page also does this, but only once it is visible).
     if (isPlaceholder(tab) && isWakeableUrl(tabUrl(tab))) {
@@ -1295,8 +1344,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // From src/retitle.js in a page: what should this tab be called?
   if (msg?.type === 'title:get' && sender.tab) {
     const id = sender.tab.id;
-    sendResponse({ name: (favById(state.tabToFav[id]) ?? pinById(state.tabToPin[id]))?.name ?? null });
-    return;
+    // Through the queue: a cold service worker must finish loading state first.
+    run(() => sendResponse({ name: (favById(state.tabToFav[id]) ?? pinById(state.tabToPin[id]))?.name ?? null }));
+    return true;
   }
   if (!msg?.type?.startsWith('spaces:') && !msg?.type?.startsWith('items:')) return;
   if (sender.tab && !sender.url?.startsWith(chrome.runtime.getURL(''))) return; // extension pages only

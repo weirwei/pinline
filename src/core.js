@@ -21,7 +21,7 @@ function originOf(url) {
 
 /** Pages we never treat as a pin (blank / new tab pages have no stable identity). */
 export function isPinnableUrl(url) {
-  if (!url) return false;
+  if (!url || !isOpenableUrl(url)) return false;
   return !/^(chrome:\/\/newtab|about:blank|chrome-search:)/.test(url);
 }
 
@@ -89,6 +89,20 @@ export function isWakeableUrl(url) {
   } catch {
     return false;
   }
+}
+
+/** URLs we are willing to open for a Fav / Pin (never javascript:, data:, blob: or file:). */
+export function isOpenableUrl(url) {
+  try {
+    return ['http:', 'https:', 'ftp:', 'chrome:', 'chrome-extension:', 'edge:', 'about:'].includes(new URL(url).protocol);
+  } catch {
+    return false;
+  }
+}
+
+/** Keep the first occurrence of each value (and only values `keep` accepts). */
+export function uniqueOrder(list, keep = () => true) {
+  return [...new Set(list)].filter(keep);
 }
 
 /**

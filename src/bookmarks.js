@@ -10,7 +10,7 @@
 // local value and is written back by mirrorToBookmarks(). Deleting a whole folder does NOT delete
 // the Space / Favs: the folder is re-created (delete Spaces from the "Manage Spaces" page).
 
-import { displayOrder, normalizeUrl } from './core.js';
+import { displayOrder, isOpenableUrl, normalizeUrl } from './core.js';
 
 export const ROOT_TITLE = 'Pinline';
 export const FAV_TITLE = '⭐ Fav';
@@ -72,7 +72,7 @@ export function mergeFromBookmarks(model, root, base, trash, newId) {
 
   /** The Fav / Pin a bookmark stands for (creating or converting it as needed). */
   const itemFor = (node, kind, spaceId, groupId) => {
-    if (trash.has(node.id)) return null;
+    if (trash.has(node.id) || !isOpenableUrl(node.url)) return null; // e.g. javascript: bookmarklets
     const hit = owner.get(node.id);
     if (hit?.[0] === kind) {
       const it = hit[1];
@@ -237,11 +237,15 @@ export async function mirrorToBookmarks(model, bm, parentId) {
     if (n.parentId !== parent) await bm.move(n.id, { parentId: parent });
     if (n.title !== title || n.url !== item.url) await bm.update(n.id, { title, url: item.url });
   };
-  // Only ever moves items up, which sidesteps index quirks when moving inside one folder.
+  // One read per folder, then the order is tracked locally (only ever moves items up, which
+  // sidesteps index quirks when moving inside one folder).
   const arrange = async (parent, ids) => {
+    let kids = (await bm.getChildren(parent)).map((c) => c.id);
     for (let i = 0; i < ids.length; i++) {
-      const kids = await bm.getChildren(parent);
-      if (kids[i]?.id !== ids[i]) await bm.move(ids[i], { parentId: parent, index: i });
+      if (kids[i] === ids[i]) continue;
+      await bm.move(ids[i], { parentId: parent, index: i });
+      kids = kids.filter((id) => id !== ids[i]);
+      kids.splice(i, 0, ids[i]);
     }
   };
 
