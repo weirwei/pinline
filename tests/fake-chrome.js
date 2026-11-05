@@ -124,6 +124,7 @@ export function createFakeChrome({ tabs: initialTabs = [], local = {}, sync = {}
   function activate(tab) {
     if (tab.active) return;
     order[tab.windowId].forEach((t) => (t.active = t === tab));
+    tab.lastAccessed = Date.now(); // like Chrome's Tab.lastAccessed
     ev.onActivated.emit({ tabId: tab.id, windowId: tab.windowId });
   }
 
@@ -235,6 +236,15 @@ export function createFakeChrome({ tabs: initialTabs = [], local = {}, sync = {}
     },
     action: { onClicked: event() },
     commands: { onCommand: event() },
+    alarms: {
+      onAlarm: event(),
+      all: new Map(),
+      create: async (name, info) => void chrome.alarms.all.set(name, { name, ...info }),
+      get: async (name) => (chrome.alarms.all.has(name) ? { ...chrome.alarms.all.get(name) } : undefined),
+      clear: async (name) => chrome.alarms.all.delete(name),
+      /** Test helper: the alarm goes off. */
+      fire: (name) => chrome.alarms.onAlarm.emit({ name, scheduledTime: Date.now() }),
+    },
     contextMenus: {
       onClicked: event(),
       removeAll: (cb) => cb?.(),

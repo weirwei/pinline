@@ -1,4 +1,6 @@
 // Pinline control panel: the page behind the divider tab. Everything goes through the service worker.
+import { filterArchive } from './core.js';
+
 const me = await chrome.tabs.getCurrent();
 const windowId = me?.windowId;
 const send = (msg) => chrome.runtime.sendMessage({ ...msg, windowId }).catch(() => null);
@@ -257,11 +259,87 @@ $('import').addEventListener('submit', (e) => {
   send({ type: 'spaces:import', folderId: opt.value });
 });
 
+// ---------- archive ----------
+
+let archive = [];
+
+function ago(ms) {
+  const min = Math.max(0, Math.round((Date.now() - ms) / 60000));
+  if (min < 1) return '刚刚';
+  if (min < 60) return `${min} 分钟前`;
+  const h = Math.round(min / 60);
+  if (h < 24) return `${h} 小时前`;
+  const d = Math.round(h / 24);
+  if (d < 30) return `${d} 天前`;
+  return new Date(ms).toLocaleDateString('zh-CN');
+}
+
+function favicon(url) {
+  const u = new URL(chrome.runtime.getURL('/_favicon/'));
+  u.searchParams.set('pageUrl', url);
+  u.searchParams.set('size', '16');
+  return u.href;
+}
+
+function showArchive(res) {
+  if (!res) return;
+  archive = res.archive ?? [];
+  if (document.activeElement !== $('archive-after')) $('archive-after').value = String(res.settings?.archiveAfterHours ?? 0);
+  renderArchive();
+}
+
+function renderArchive() {
+  const list = filterArchive(archive, $('archive-search').value);
+  $('archive-clear').disabled = !archive.length;
+  if (!list.length) {
+    const li = Object.assign(document.createElement('li'), { className: 'empty', textContent: archive.length ? '没有匹配的标签' : '还没有归档的标签' });
+    return $('archive').replaceChildren(li);
+  }
+  $('archive').replaceChildren(
+    ...list.map((entry) => {
+      const li = document.createElement('li');
+      const open = Object.assign(document.createElement('button'), { className: 'entry', type: 'button', title: entry.url });
+      const img = Object.assign(document.createElement('img'), { src: favicon(entry.url), alt: '' });
+      const t = Object.assign(document.createElement('span'), { className: 't', textContent: entry.title || entry.url });
+      const when = Object.assign(document.createElement('span'), { className: 'when', textContent: ago(entry.archivedAt) });
+      open.append(img, t, when);
+      open.addEventListener('click', async () => {
+        say(`重新打开「${entry.title || entry.url}」`);
+        showArchive(await send({ type: 'archive:open', id: entry.id }));
+      });
+      const del = Object.assign(document.createElement('button'), { className: 'x', type: 'button', textContent: '×' });
+      del.setAttribute('aria-label', `从归档删除 ${entry.title || entry.url}`);
+      del.addEventListener('click', async () => showArchive(await send({ type: 'archive:delete', id: entry.id })));
+      li.append(open, del);
+      return li;
+    }),
+  );
+}
+
+const refreshArchive = async () => showArchive(await send({ type: 'archive:list' }));
+
+$('archive-search').addEventListener('input', renderArchive);
+$('archive-after').addEventListener('change', async () => {
+  const hours = Number($('archive-after').value);
+  showArchive(await send({ type: 'settings:set', archiveAfterHours: hours }));
+  say(hours ? `自动归档：${$('archive-after').selectedOptions[0].textContent}没打开过的标签` : '自动归档已关闭');
+});
+$('archive-clear').addEventListener('click', async () => {
+  if (!archive.length || !confirm(`清空归档？${archive.length} 条记录会被删除，无法恢复。`)) return;
+  showArchive(await send({ type: 'archive:clear' }));
+  say('归档已清空');
+});
+$('clear-unpinned').addEventListener('click', async () => {
+  const res = await send({ type: 'archive:clear-unpinned' });
+  showArchive(res);
+  say(res?.cleared ? `已归档 ${res.cleared} 个标签` : '分割线下方没有要归档的标签');
+});
+
 // ---------- shortcuts ----------
 
 async function renderKeys() {
   const commands = await chrome.commands.getAll();
-  const wanted = ['copy-url', 'toggle-fav', 'toggle-pin', 'next-space', 'prev-space', 'new-space', 'manage-spaces', 'reset-pin', 'set-pin-home'];
+  const wanted = ['copy-url', 'toggle-fav', 'toggle-pin', 'mru-back', 'clear-unpinned', 'next-space', 'prev-space', 'new-space', 'manage-spaces', 'reset-pin', 'set-pin-home'];
   $('keys').replaceChildren(
     ...wanted
       .map((name) => commands.find((c) => c.name === name))
@@ -284,15 +362,17 @@ $('edit-keys').addEventListener('click', () => chrome.tabs.create({ url: 'chrome
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && (changes.spaces || changes.spaceTabs || changes.pins || changes.favs)) refresh();
+  if (area === 'local' && (changes.archive || changes.settings)) refreshArchive();
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     refresh();
+    refreshArchive();
     renderKeys();
   }
 });
 
 await refresh();
-await Promise.all([suggestName(), renderKeys(), loadFolders()]);
+await Promise.all([suggestName(), renderKeys(), loadFolders(), refreshArchive()]);
 focusNewIfAsked();
 focusRenameIfAsked();

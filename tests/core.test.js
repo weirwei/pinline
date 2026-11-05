@@ -77,3 +77,31 @@ test('displayOrder keeps a group together at its first pin', async () => {
   const view = displayOrder(pins, groups).map((x) => (x.pin ? x.pin.id : `${x.group.id}[${x.pins.map((p) => p.id)}]`));
   assert.deepEqual(view, ['a', 'g[b,d]', 'c', 'e', 'empty[]']);
 });
+
+test('archive helpers: isStale, pushArchive cap, filterArchive, ageOutSaved', async () => {
+  const { isStale, pushArchive, filterArchive, ageOutSaved, HOUR_MS } = await import('../src/core.js');
+  assert.equal(isStale(0, 12 * HOUR_MS, 12), true);
+  assert.equal(isStale(1, 12 * HOUR_MS, 12), false);
+  assert.equal(isStale(0, 1e12, 0), false, '0 hours = off');
+  assert.deepEqual(pushArchive([{ id: 'a' }, { id: 'b' }], [{ id: 'n' }], 2).map((e) => e.id), ['n', 'a']);
+  const list = [{ title: 'GitHub Pulls', url: 'https://github.com/pulls' }, { title: '文档', url: 'https://docs.example.com/' }];
+  assert.deepEqual(filterArchive(list, 'git PULL').map((e) => e.title), ['GitHub Pulls']);
+  assert.deepEqual(filterArchive(list, '文档'), [list[1]]);
+  assert.equal(filterArchive(list, '  ').length, 2);
+
+  const now = 100 * HOUR_MS;
+  const items = [{ url: 'a', seen: 0 }, { url: 'b', seen: now }, { url: 'c' }];
+  const r = ageOutSaved(items, { tab: 1 }, now, 12);
+  assert.deepEqual(r.gone.map((x) => x.url), ['a']);
+  assert.deepEqual(r.keep.map((x) => [x.url, x.seen]), [['b', now], ['c', now]], 'items without a time start now');
+  assert.deepEqual(r.active, { tab: 0 }, 'selection follows its item');
+  assert.equal(ageOutSaved(items, { tab: 0 }, now, 12).active, null);
+  assert.deepEqual(ageOutSaved(items, { pin: 'p' }, now, 12).active, { pin: 'p' });
+});
+
+test('touchMru moves a tab to the front, no duplicates, capped', async () => {
+  const { touchMru } = await import('../src/core.js');
+  assert.deepEqual(touchMru([1, 2, 3], 3), [3, 1, 2]);
+  assert.deepEqual(touchMru(undefined, 5), [5]);
+  assert.deepEqual(touchMru([1, 2, 3], 4, 3), [4, 1, 2]);
+});

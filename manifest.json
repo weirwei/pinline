@@ -13,7 +13,8 @@
     "tabGroups",
     "scripting",
     "offscreen",
-    "clipboardWrite"
+    "clipboardWrite",
+    "alarms"
   ],
   "background": {
     "service_worker": "src/background.js",
@@ -107,6 +108,12 @@
     },
     "manage-spaces": {
       "description": "打开 Pinline 面板"
+    },
+    "clear-unpinned": {
+      "description": "归档分割线下方的所有标签"
+    },
+    "mru-back": {
+      "description": "切到上一个最近使用的标签（连按往回走）"
     }
   },
   "optional_host_permissions": [

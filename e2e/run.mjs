@@ -410,6 +410,91 @@ try {
   check((await evalSW(`return (await chrome.tabGroups.query({})).length;`)) === 1, 'exactly one live tab group');
   saveTabGroupsProfile = true;
 
+  // ---------- Archive / Clear unpinned / recent tabs ----------
+  const alarm = await evalSW(`return await chrome.alarms.get('pinline-archive');`);
+  check(alarm?.periodInMinutes === 15, `archive alarm every 15 minutes (${alarm?.periodInMinutes})`);
+  const cmds = await evalSW(`return (await chrome.commands.getAll()).filter(c => ['clear-unpinned', 'mru-back'].includes(c.name)).map(c => c.name + ':' + (c.shortcut || ''));`);
+  check(cmds.length === 2 && cmds.every((c) => c.endsWith(':')), `new commands registered without a default key (${cmds})`);
+  const pinCount = async () => (await stripOf(winA)).filter((x) => x.startsWith('P')).length;
+  const pinsBefore = await pinCount();
+  const arc = await evalSW(`
+    const out = [];
+    for (const u of ['https://example.com/?arc1', 'https://example.com/?arc2', 'https://example.com/?keep']) out.push((await chrome.tabs.create({ windowId: ${winA}, url: u, active: false })).id);
+    return out;`);
+  await sleep(2500);
+  const la = await evalSW(`return (await chrome.tabs.get(${arc[0]})).lastAccessed;`);
+  console.log(`  INFO Tab.lastAccessed of a never-selected tab: ${la ? Math.round((Date.now() - la) / 1000) + ' s ago' : la}`);
+  await evalSW(`await chrome.tabs.update(${arc[2]}, { active: true });`);
+  await sleep(600);
+  await evalSW(`await pinline.setArchiveAfter(12);`);
+  const bActive = await evalSW(`const [t] = await chrome.tabs.query({ active: true, windowId: ${winB} }); return t.id;`);
+  const n0 = await evalSW(`return await pinline.archivePass(Date.now() + 11 * 3600e3);`);
+  check(n0 === 0, `nothing archived before 12 h (${n0})`);
+  const n1 = await evalSW(`return await pinline.archivePass(Date.now() + 13 * 3600e3);`);
+  await sleep(1500);
+  a = await stripOf(winA);
+  console.log(`  A after archive pass (${n1} archived):`, a.join('  '));
+  const archived = await evalSW(`return (await chrome.storage.local.get('archive')).archive.map(e => e.url);`);
+  check(!a.includes('https://example.com/?arc1') && !a.includes('https://example.com/?arc2') && archived.includes('https://example.com/?arc1') && archived.includes('https://example.com/?arc2'), 'stale tabs closed into the archive');
+  check(a.includes('https://example.com/?keep') && (await pinCount()) === pinsBefore, 'selected tab and Pins kept');
+  const bKept = await evalSW(`return !!(await chrome.tabs.get(${bActive}).catch(() => null));`);
+  check(bKept, 'the selected tab of the other window is kept');
+
+  // Panel: list, search, reopen.
+  await evalSW(`await pinline.openPanel(${winA});`);
+  await sleep(1000);
+  panel = await panelOf(winA);
+  const arcView = await panel.ev(`await new Promise(r => setTimeout(r, 400));
+    const rows = () => [...document.querySelectorAll('#archive .entry')].map(e => e.title);
+    const all = rows();
+    const s = document.getElementById('archive-search'); s.value = 'arc1'; s.dispatchEvent(new Event('input'));
+    return { all, filtered: rows(), after: document.getElementById('archive-after').value };`);
+  console.log('  archive in panel:', JSON.stringify(arcView));
+  check(arcView.all.includes('https://example.com/?arc1') && arcView.filtered.length === 1 && arcView.after === '12', 'panel lists the archive, search filters it, setting shown');
+  await panel.ev(`document.querySelector('#archive .entry').click();`);
+  await sleep(2000);
+  check(panel.errors.length === 0, `no errors in the panel${panel.errors.length ? ': ' + panel.errors.join(' | ') : ''}`);
+  panel.close();
+  a = await stripOf(winA);
+  const reActive = await evalSW(`const [t] = await chrome.tabs.query({ active: true, windowId: ${winA} }); return t.url || t.pendingUrl;`);
+  check(a[a.indexOf('|') + 1] === 'https://example.com/?arc1' && reActive === 'https://example.com/?arc1', `clicking an entry reopens it below the divider, selected (${a.join(' ')})`);
+  const still = await evalSW(`return (await chrome.storage.local.get('archive')).archive.map(e => e.url);`);
+  check(!still.includes('https://example.com/?arc1'), 'reopened entry left the archive');
+
+  // Clear unpinned.
+  const cleared = await evalSW(`return await pinline.clearUnpinned(${winA});`);
+  await sleep(1500);
+  a = await stripOf(winA);
+  console.log(`  A after clear-unpinned (${cleared}):`, a.join('  '));
+  const activeAfterClear = await evalSW(`const [t] = await chrome.tabs.query({ active: true, windowId: ${winA} }); return t.url || t.pendingUrl;`);
+  check(JSON.stringify(a.slice(a.indexOf('|') + 1)) === JSON.stringify(['chrome://newtab/']) && activeAfterClear === 'chrome://newtab/', 'clear-unpinned: only a selected new tab is left below the divider');
+  check((await pinCount()) === pinsBefore, 'clear-unpinned keeps the Pins');
+  const archived2 = await evalSW(`return (await chrome.storage.local.get('archive')).archive.slice(0, 5).map(e => e.url);`);
+  check(archived2.includes('https://example.com/?arc1') && archived2.includes('https://example.com/?keep'), `cleared tabs are in the archive (${archived2.join(' ')})`);
+
+  // Recent tabs.
+  const mruIds = await evalSW(`
+    const out = [];
+    for (const u of ['https://example.com/?m1', 'https://example.com/?m2', 'https://example.com/?m3']) out.push((await chrome.tabs.create({ windowId: ${winA}, url: u, active: true })).id);
+    return out;`);
+  await sleep(1500);
+  for (const id of mruIds) {
+    await evalSW(`await chrome.tabs.update(${id}, { active: true });`);
+    await sleep(400);
+  }
+  const activeNowId = () => evalSW(`const [t] = await chrome.tabs.query({ active: true, windowId: ${winA} }); return t.id;`);
+  await evalSW(`await pinline.mruBack(${winA});`);
+  await sleep(300);
+  const step1 = await activeNowId();
+  await evalSW(`await pinline.mruBack(${winA});`);
+  await sleep(300);
+  const step2 = await activeNowId();
+  check(step1 === mruIds[1] && step2 === mruIds[0], `mru-back walks back: m2 then m1 (${step1}, ${step2})`);
+  await sleep(2000);
+  const mru = await evalSW(`return [pinline.state.mru[${winA}].slice(0, 3), (await chrome.storage.session.get('mru')).mru[${winA}].slice(0, 3)];`);
+  check(JSON.stringify(mru[0]) === JSON.stringify([mruIds[0], mruIds[2], mruIds[1]]) && JSON.stringify(mru[1]) === JSON.stringify(mru[0]), `after the pause the landing tab is first, saved in storage.session (${JSON.stringify(mru)})`);
+  await evalSW(`await pinline.setArchiveAfter(0);`);
+
   check(errors.length === 0, `no service worker errors${errors.length ? ': ' + errors.join(' | ') : ''}`);
   ws.close();
 } catch (err) {

@@ -63,6 +63,20 @@
     #names td.kind { width: 34px; color: var(--muted); font-size: 12px; }
     #names input { width: 100%; }
     #names tr.focus input { outline: 2px solid var(--accent); }
+    /* Archive */
+    #archive { list-style: none; margin: 8px 0 0; padding: 0; max-height: 360px; overflow: auto; }
+    #archive li { display: grid; grid-template-columns: 1fr auto; gap: 4px; align-items: center; border-bottom: 1px solid var(--line); }
+    #archive li:last-child { border-bottom: none; }
+    .entry { display: grid; grid-template-columns: 16px 1fr auto; gap: 8px; align-items: center; text-align: left; padding: 6px 4px;
+      border: none; background: transparent; color: inherit; font: inherit; font-size: 13px; cursor: pointer; border-radius: 6px; min-width: 0; }
+    .entry:hover { background: var(--bg); }
+    .entry:focus-visible, .x:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
+    .entry img { width: 16px; height: 16px; }
+    .entry .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .entry .when { color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .x { border: none; background: transparent; color: var(--muted); font-size: 16px; line-height: 1; padding: 4px 8px; border-radius: 6px; cursor: pointer; }
+    .x:hover { color: var(--danger); background: var(--bg); }
+    #archive .empty { color: var(--muted); font-size: 13px; padding: 6px 0; display: block; border: none; }
     #status { min-height: 1.5em; color: var(--muted); font-size: 12px; }
   </style>
 </head>
@@ -91,6 +105,27 @@
           <button class="btn danger" id="delete" type="button">删除</button>
         </div>
         <p class="hint" id="current-meta"></p>
+      </section>
+
+      <section class="card" aria-labelledby="archive-title">
+        <h1 id="archive-title">归档</h1>
+        <label class="field" for="archive-after">自动归档：多久没打开过的标签</label>
+        <div class="row">
+          <select id="archive-after">
+            <option value="0">关闭</option>
+            <option value="12">12 小时</option>
+            <option value="24">24 小时</option>
+            <option value="168">7 天</option>
+            <option value="720">30 天</option>
+          </select>
+          <button class="btn" id="clear-unpinned" type="button">归档分割线下方的所有标签</button>
+        </div>
+        <p class="hint">超时的普通标签会被关掉并放进下面的列表（隐藏 Space 里存着的标签也算）。不会自动归档：Fav、Pin、每个窗口当前选中的、正在播放声音的、在标签组里的。每 15 分钟检查一次。点一条在分割线下方重新打开。</p>
+        <div class="row">
+          <input id="archive-search" type="search" placeholder="搜索标题或网址" autocomplete="off" aria-label="搜索归档">
+          <button class="btn danger" id="archive-clear" type="button">清空</button>
+        </div>
+        <ul id="archive" aria-label="已归档的标签"></ul>
       </section>
 
       <section class="card" aria-labelledby="names-title">

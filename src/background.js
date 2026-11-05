@@ -29,6 +29,11 @@ import {
   displayOrder,
   isOpenableUrl,
   uniqueOrder,
+  ARCHIVE_CHOICES,
+  ageOutSaved,
+  isStale,
+  pushArchive,
+  touchMru,
 } from './core.js';
 import { ROOT_TITLE, mergeFromBookmarks, mirrorToBookmarks, snapshot } from './bookmarks.js';
 
@@ -50,6 +55,10 @@ const state = {
   bmTrash: [], // bookmark ids of things removed in Pinline, to delete from bookmarks on next sync
   spaceTabs: {}, // spaceId -> [{ url, title }] tabs of a hidden Space (closed, re-opened asleep on switch)
   spaceActive: {}, // spaceId -> what was selected: { pin: pinId } | { tab: index into spaceTabs }
+  lastSeen: {}, // tabId -> when the tab was last selected (ms), for auto-archive
+  archive: [], // archived tabs, newest first [{ id, url, title, favIconUrl?, spaceId, archivedAt }]
+  settings: { archiveAfterHours: 0 }, // 0 = auto-archive off
+  mru: {}, // windowId -> tab ids, most recently used first (storage.session)
   ready: false, // set once this browser session has been reconciled; until then never create tabs
 };
 const selfPinOps = new Set(); // tab ids whose native `pinned` flag we are flipping ourselves
@@ -82,14 +91,17 @@ let bmBase = { nodes: {}, order: {} }; // snapshot of what we last wrote to book
 let bmSyncing = false;
 async function loadState() {
   const keys = ['spaces', 'favs', 'pins', 'groups'];
-  const local = await chrome.storage.local.get([...keys, 'spaceTabs', 'spaceActive', 'bm', 'bmTrash', 'bmBase']);
+  const local = await chrome.storage.local.get([...keys, 'spaceTabs', 'spaceActive', 'bm', 'bmTrash', 'bmBase', 'archive', 'settings']);
+  state.archive = local.archive ?? [];
+  state.settings = { ...state.settings, ...local.settings };
   state.bm = local.bm ?? {};
   state.bmTrash = local.bmTrash ?? [];
   bmBase = local.bmBase ?? { nodes: {}, order: {} };
   state.spaceTabs = local.spaceTabs ?? {};
   state.spaceActive = local.spaceActive ?? {};
   const sync = local.pins || local.favs ? {} : await chrome.storage.sync.get(keys);
-  const session = await chrome.storage.session.get(['ready']);
+  const session = await chrome.storage.session.get(['ready', 'mru']);
+  state.mru = session.mru ?? {};
   // Tab bindings live in storage.local so they survive reloading the extension (tab ids stay valid
   // until the browser restarts; onStartup clears them).
   const tabs = (await chrome.storage.local.get('tabs')).tabs ?? {};
@@ -99,6 +111,7 @@ async function loadState() {
   state.windowSpace = tabs.windowSpace ?? {};
   state.sleepers = tabs.sleepers ?? {};
   state.groupMap = tabs.groupMap ?? {};
+  state.lastSeen = tabs.lastSeen ?? {};
   lastTabs = JSON.stringify(tabs);
   state.ready = session.ready ?? false;
   ensureSpaces();
@@ -107,11 +120,11 @@ async function loadState() {
 
 async function persist() {
   await chrome.storage.session.set({ ready: state.ready });
-  const { tabToFav, tabToPin, windowSpace, sleepers, groupMap } = state;
-  const tabs = JSON.stringify({ tabToFav, tabToPin, windowSpace, sleepers, groupMap });
+  const { tabToFav, tabToPin, windowSpace, sleepers, groupMap, lastSeen } = state;
+  const tabs = JSON.stringify({ tabToFav, tabToPin, windowSpace, sleepers, groupMap, lastSeen });
   if (tabs !== lastTabs) {
     lastTabs = tabs;
-    await chrome.storage.local.set({ tabs: { tabToFav, tabToPin, windowSpace, sleepers, groupMap } });
+    await chrome.storage.local.set({ tabs: { tabToFav, tabToPin, windowSpace, sleepers, groupMap, lastSeen } });
   }
   const lists = JSON.stringify([state.spaces, state.favs, state.pins, state.groups, state.bm, state.bmTrash]);
   if (lists === lastSaved) return; // layout runs often; only write real changes
@@ -249,11 +262,12 @@ async function removeFav(favId, keepTabId, trash = true) {
 }
 
 function remapTab(oldId, newId) {
-  for (const map of [state.tabToFav, state.tabToPin, state.sleepers]) {
+  for (const map of [state.tabToFav, state.tabToPin, state.sleepers, state.lastSeen]) {
     if (map[oldId] === undefined) continue;
     map[newId] = map[oldId];
     delete map[oldId];
   }
+  for (const w of Object.keys(state.mru)) state.mru[w] = state.mru[w].map((id) => (id === oldId ? newId : id));
 }
 
 /** Move a tab just below the divider (or leave it where it is if the window has none). */
@@ -726,7 +740,7 @@ async function switchSpace(windowId, target) {
     }
     if (!isPinnableUrl(tabUrl(t))) continue; // new tab / blank pages are not worth keeping
     if (t.active) active = { tab: saved.length };
-    saved.push({ url: tabUrl(t), title: t.title || tabUrl(t) });
+    saved.push({ url: tabUrl(t), title: t.title || tabUrl(t), seen: t.active ? Date.now() : lastUsed(t, Date.now()) });
   }
   state.spaceTabs[currentId] = saved;
   state.spaceActive[currentId] = active;
@@ -740,6 +754,7 @@ async function switchSpace(windowId, target) {
   const open = async (item, isShown) => {
     const tab = await createSelf({ windowId, url: isShown ? item.url : sleepingUrl(item), active: isShown });
     if (!isShown) pendingDiscard.add(tab.id);
+    if (!item.space) state.lastSeen[tab.id] = isShown ? Date.now() : item.seen ?? Date.now(); // its age carries over
     if (!isShown && !item.space && isWakeableUrl(item.url)) state.sleepers[tab.id] = { w: windowId, url: item.url, title: item.title };
     return tab;
   };
@@ -817,6 +832,214 @@ async function deleteSpace(spaceId) {
   await chrome.storage.local.set({ spaceTabs: state.spaceTabs, spaceActive: state.spaceActive });
   await persist();
   await layoutAll(); // with one Space left, dividers drop the name
+}
+
+// ---------- archive (Arc's auto-archive and "Clear unpinned") ----------
+//
+// Normal tabs below the divider that were not selected for N hours are closed and listed in the
+// panel's archive. Never archived automatically: Favs, Pins, the divider, the selected tab of each
+// window, tabs playing sound, and tabs in a (user) tab group. Hidden Spaces' saved tabs age out
+// the same way, by when they were last used.
+
+const ARCHIVE_ALARM = 'pinline-archive';
+const ARCHIVE_EVERY_MIN = 15;
+
+/** When a tab was last used: our own record, else Chrome's lastAccessed, else from now on. */
+function lastUsed(tab, now) {
+  const seen = state.lastSeen[tab.id] ?? tab.lastAccessed;
+  if (Number.isFinite(seen) && seen > 0) return seen;
+  state.lastSeen[tab.id] = now;
+  return now;
+}
+
+/** Archive entry for a tab or a saved tab (null for pages not worth keeping: new tab, blank...). */
+function archiveEntry({ url, title, favIconUrl }, spaceId, now) {
+  if (!isPinnableUrl(url)) return null;
+  const icon = /^(https?:|data:image\/)/.test(favIconUrl ?? '') ? favIconUrl : undefined;
+  return { id: crypto.randomUUID(), url, title: title || url, favIconUrl: icon, spaceId, archivedAt: now };
+}
+
+let lastArchive = null;
+async function saveArchive() {
+  const json = JSON.stringify(state.archive);
+  if (json === lastArchive) return;
+  lastArchive = json;
+  await chrome.storage.local.set({ archive: state.archive });
+}
+
+/** Close tabs and put them into the archive (newest first). */
+async function archiveTabs(tabs, spaceId, now = Date.now()) {
+  const entries = tabs
+    .map((t) => archiveEntry({ url: tabUrl(t), title: t.title, favIconUrl: isPlaceholder(t) ? undefined : t.favIconUrl }, spaceId, now))
+    .filter(Boolean);
+  state.archive = pushArchive(state.archive, entries);
+  await saveArchive(); // saved before closing: nothing is lost if the browser dies in between
+  for (const t of tabs) {
+    delete state.sleepers[t.id];
+    pendingDiscard.delete(t.id);
+  }
+  await chrome.tabs.remove(tabs.map((t) => t.id)).catch(async () => {
+    for (const t of tabs) await chrome.tabs.remove(t.id).catch(() => {});
+  });
+}
+
+/** One auto-archive pass (the alarm runs it every 15 minutes). `now` can be faked for tests. */
+async function archivePass(now = Date.now()) {
+  const hours = state.settings.archiveAfterHours;
+  if (!state.ready || !hours) return 0;
+  let count = 0;
+  const shown = new Set();
+  for (const windowId of await normalWindowIds()) {
+    const tabs = await windowTabs(windowId);
+    const spaceId = spaceOfWindow(windowId, tabs);
+    shown.add(spaceId);
+    const d = tabs.findIndex(isDivider);
+    const stale = [];
+    for (const t of tabs) {
+      if (t.active) {
+        if (!isDivider(t)) state.lastSeen[t.id] = now; // in use right now
+        continue;
+      }
+      const protectedTab = t.pinned || favIdOf(t.id) || pinIdOf(t.id) || isDivider(t) || t.audible || t.groupId > -1 || (d >= 0 && t.index < d);
+      if (!protectedTab && isStale(lastUsed(t, now), now, hours)) stale.push(t);
+    }
+    if (stale.length) await archiveTabs(stale, spaceId, now);
+    count += stale.length;
+  }
+
+  // Hidden Spaces: their saved tabs age out too.
+  let changed = false;
+  for (const [spaceId, items] of Object.entries(state.spaceTabs)) {
+    if (shown.has(spaceId) || !Array.isArray(items)) continue;
+    const r = ageOutSaved(items, state.spaceActive[spaceId], now, hours);
+    if (!r.gone.length && r.keep.every((x, i) => x === items[i])) continue;
+    changed = true;
+    state.spaceTabs[spaceId] = r.keep;
+    state.spaceActive[spaceId] = r.active;
+    state.archive = pushArchive(state.archive, r.gone.map((it) => archiveEntry(it, spaceId, now)).filter(Boolean));
+    count += r.gone.length;
+  }
+  if (changed) {
+    await saveArchive();
+    await chrome.storage.local.set({ spaceTabs: state.spaceTabs, spaceActive: state.spaceActive });
+  }
+  await persist();
+  return count;
+}
+
+/** Arc's ⌘⇧K: archive every normal tab below the divider of a window. */
+async function clearUnpinned(windowId) {
+  if (!(await isNormalWindow(windowId))) return 0;
+  await layout(windowId);
+  const tabs = await windowTabs(windowId);
+  const d = tabs.findIndex(isDivider);
+  if (d < 0) return 0;
+  // An empty new tab that is selected stays: it is where you go next anyway.
+  const below = tabs.slice(d + 1).filter((t) => !t.pinned && !favIdOf(t.id) && !pinIdOf(t.id) && !(t.active && !isPinnableUrl(tabUrl(t))));
+  if (!below.length) return 0;
+  // Never leave the window on a closing tab: Chrome would pick a neighbour (often the divider).
+  if (below.some((t) => t.active)) await createSelf({ windowId, url: 'chrome://newtab/', active: true });
+  await archiveTabs(below, spaceOfWindow(windowId, tabs));
+  await layout(windowId);
+  return below.length;
+}
+
+/** Re-open an archived tab in a window, right below the divider, and drop it from the archive. */
+async function openArchived(entryId, windowId) {
+  const entry = state.archive.find((e) => e.id === entryId);
+  if (!entry || !(await isNormalWindow(windowId))) return;
+  state.archive = state.archive.filter((e) => e !== entry);
+  await saveArchive();
+  if (!isOpenableUrl(entry.url)) return;
+  const divider = (await windowTabs(windowId)).find(isDivider);
+  const tab = await createSelf({ windowId, url: entry.url, active: true, ...(divider ? { index: divider.index + 1 } : {}) });
+  state.lastSeen[tab.id] = Date.now();
+  await layout(windowId);
+  await chrome.windows.update(windowId, { focused: true }).catch(() => {});
+}
+
+async function deleteArchived(entryId) {
+  state.archive = state.archive.filter((e) => e.id !== entryId);
+  await saveArchive();
+}
+
+async function clearArchive() {
+  state.archive = [];
+  await saveArchive();
+}
+
+async function setArchiveAfter(hours) {
+  const h = Number(hours);
+  if (!ARCHIVE_CHOICES.includes(h)) return;
+  state.settings = { ...state.settings, archiveAfterHours: h };
+  await chrome.storage.local.set({ settings: state.settings });
+}
+
+async function ensureArchiveAlarm() {
+  if (!chrome.alarms) return;
+  const a = await chrome.alarms.get(ARCHIVE_ALARM).catch(() => null);
+  if (!a || a.periodInMinutes !== ARCHIVE_EVERY_MIN) {
+    await chrome.alarms.create(ARCHIVE_ALARM, { delayInMinutes: ARCHIVE_EVERY_MIN, periodInMinutes: ARCHIVE_EVERY_MIN });
+  }
+}
+
+// ---------- recent tabs (Arc's Ctrl+Tab) ----------
+//
+// Each window keeps its tabs in most-recently-used order. "mru-back" goes to the previous one;
+// pressing it again within 1.5 s walks further back (like Alt-Tab), and only when you stop does
+// the tab you landed on move to the front.
+
+const MRU_WALK_MS = 1500;
+let walk = null; // { windowId, list, pos, expect, timer }
+
+let lastMru = '';
+async function saveMru() {
+  const json = JSON.stringify(state.mru);
+  if (json === lastMru) return;
+  lastMru = json;
+  await chrome.storage.session.set({ mru: state.mru });
+}
+
+function useTab(windowId, tabId) {
+  state.mru[windowId] = touchMru(state.mru[windowId], tabId);
+}
+
+async function endWalk() {
+  if (!walk) return;
+  clearTimeout(walk.timer);
+  const { windowId, list, pos } = walk;
+  walk = null;
+  if (pos >= 0 && list[pos] !== undefined) useTab(windowId, list[pos]);
+  await saveMru();
+}
+
+async function mruBack(windowId) {
+  if (walk && walk.windowId !== windowId) await endWalk();
+  const tabs = await windowTabs(windowId);
+  const live = new Set(tabs.filter((t) => !isDivider(t)).map((t) => t.id));
+  if (!walk) {
+    const active = tabs.find((t) => t.active);
+    let list = (state.mru[windowId] ?? []).filter((id) => live.has(id));
+    // Tabs not seen since the list was started (e.g. after a restart) follow, by Chrome's lastAccessed.
+    const when = (t) => state.lastSeen[t.id] ?? t.lastAccessed ?? 0;
+    const rest = tabs.filter((t) => live.has(t.id) && !list.includes(t.id)).sort((x, y) => when(y) - when(x));
+    list = [...list, ...rest.map((t) => t.id)];
+    let pos = -1; // the panel (divider) is shown: the first press goes to the most recent tab
+    if (active && live.has(active.id)) {
+      list = [active.id, ...list.filter((id) => id !== active.id)];
+      pos = 0;
+    }
+    if (list.length < (pos === 0 ? 2 : 1)) return;
+    walk = { windowId, list, pos };
+  }
+  const at = walk.list[walk.pos];
+  walk.list = walk.list.filter((id) => live.has(id)); // closed meanwhile
+  if (!walk.list.length) return void (walk = null);
+  walk.pos = (walk.list.indexOf(at) + 1) % walk.list.length;
+  walk.expect = walk.list[walk.pos];
+  clearTimeout(walk.timer);
+  walk.timer = setTimeout(() => run(endWalk), MRU_WALK_MS);
+  await chrome.tabs.update(walk.expect, { active: true }).catch(() => {});
 }
 
 // ---------- copy URL (Arc's ⌘⇧C) ----------
@@ -945,6 +1168,8 @@ async function reconcile() {
   const live = new Set(all.map((t) => t.id));
   for (const map of [state.tabToFav, state.tabToPin])
     for (const tabId of Object.keys(map)) if (!live.has(Number(tabId))) delete map[tabId];
+  const seenBefore = { ...state.lastSeen };
+  for (const tabId of Object.keys(state.lastSeen)) if (!live.has(Number(tabId))) delete state.lastSeen[tabId];
 
   ensureSpaces();
   const windowIds = await normalWindowIds();
@@ -957,6 +1182,7 @@ async function reconcile() {
     const tab = await createSelf({ windowId: s.w, url: sleepUrl(sleepBase(), s), active: false });
     pendingDiscard.add(tab.id);
     state.sleepers[tab.id] = s;
+    if (seenBefore[tabId]) state.lastSeen[tab.id] = seenBefore[tabId]; // keeps its age for auto-archive
   }
   if (lost.length) all.push(...(await chrome.tabs.query({})).filter((t) => !live.has(t.id)));
   const pinCandidates = []; // [tab, spaceId]
@@ -1136,6 +1362,7 @@ const MENU = {
   newSpace: 'pinline-new-space',
   nextSpace: 'pinline-next-space',
   manageSpaces: 'pinline-manage-spaces',
+  clearUnpinned: 'pinline-clear-unpinned',
 };
 
 function createMenus() {
@@ -1148,6 +1375,7 @@ function createMenus() {
       [MENU.rename, '重命名 Fav / Pin…'],
       [MENU.newSpace, '新建 Space…'],
       [MENU.nextSpace, '切到下一个 Space'],
+      [MENU.clearUnpinned, '归档分割线下方的所有标签'],
       [MENU.manageSpaces, '打开 Pinline 面板（Space / 设置）'],
     ];
     for (const [id, title] of items) {
@@ -1163,6 +1391,7 @@ function createMenus() {
 
 chrome.runtime.onInstalled.addListener(({ reason }) => {
   createMenus();
+  run(ensureArchiveAlarm);
   // A Chrome update also fires onStartup, which reconciles after session restore: don't race it.
   if (reason !== 'chrome_update' && reason !== 'shared_module_update') run(reconcile);
 });
@@ -1190,7 +1419,10 @@ chrome.runtime.onStartup.addListener(() => {
     state.windowSpace = {};
     state.sleepers = {};
     state.groupMap = {};
+    state.lastSeen = {}; // tabs restored by Chrome fall back to Tab.lastAccessed
+    state.mru = {};
   });
+  run(ensureArchiveAlarm);
   // Wait until Chrome has restored the session before deciding what is missing.
   run(() => waitForRestore().then(reconcile));
 });
@@ -1202,6 +1434,7 @@ chrome.windows.onCreated.addListener((win) => {
 
 chrome.tabs.onCreated.addListener((tab) => {
   run(async () => {
+    state.lastSeen[tab.id] ??= Date.now(); // a new tab counts as just used (unless we set its age)
     if (selfCreated.delete(tab.id) || !state.ready) return;
     const cur = await getTab(tab.id); // the event's snapshot may be stale by now
     if (!cur || favIdOf(cur.id) || pinIdOf(cur.id)) return;
@@ -1238,6 +1471,11 @@ chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
 chrome.tabs.onRemoved.addListener((tabId, { windowId, isWindowClosing }) => {
   closedAt[windowId] = Date.now();
   run(async () => {
+    delete state.lastSeen[tabId];
+    if (state.mru[windowId]?.includes(tabId)) {
+      state.mru[windowId] = state.mru[windowId].filter((id) => id !== tabId);
+      await saveMru();
+    }
     if (switchClosing.delete(tabId)) return;
     delete state.sleepers[tabId];
     pendingDiscard.delete(tabId);
@@ -1288,6 +1526,7 @@ chrome.tabGroups?.onRemoved.addListener((g) => {
 chrome.tabs.onReplaced.addListener((addedId, removedId) => {
   run(async () => {
     remapTab(removedId, addedId);
+    await saveMru();
     await persist();
   });
 });
@@ -1316,7 +1555,20 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
     if (!tab) return;
     // Wait outside the queue so a matching onRemoved can arrive first without blocking other events.
     if (isDivider(tab)) return void setTimeout(() => run(() => onDividerActivated(tab)), 150);
+    const now = Date.now();
+    const prev = lastActive[windowId] ?? state.mru[windowId]?.[0];
+    if (prev !== undefined && prev !== tabId && state.lastSeen[prev] !== undefined) state.lastSeen[prev] = now; // used until now
+    state.lastSeen[tabId] = now;
     lastActive[windowId] = tabId;
+    // Recent-tabs order: a step of an mru-back walk does not count until the walk ends.
+    if (walk?.windowId === windowId && walk.expect === tabId) {
+      // part of the walk
+    } else {
+      if (walk?.windowId === windowId) await endWalk(); // the user picked another tab mid-walk
+      useTab(windowId, tabId);
+      await saveMru();
+    }
+    await persist();
     // Wake a sleeping placeholder right away (its page also does this, but only once it is visible).
     if (isPlaceholder(tab) && isWakeableUrl(tabUrl(tab))) {
       pendingDiscard.delete(tabId);
@@ -1348,7 +1600,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     run(() => sendResponse({ name: (favById(state.tabToFav[id]) ?? pinById(state.tabToPin[id]))?.name ?? null }));
     return true;
   }
-  if (!msg?.type?.startsWith('spaces:') && !msg?.type?.startsWith('items:')) return;
+  if (!/^(spaces|items|archive|settings):/.test(msg?.type ?? '')) return;
   if (sender.tab && !sender.url?.startsWith(chrome.runtime.getURL(''))) return; // extension pages only
   const windowId = Number.isInteger(msg.windowId) ? msg.windowId : undefined;
   let result;
@@ -1358,6 +1610,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'spaces:delete') await deleteSpace(msg.id);
     if (msg.type === 'spaces:new') await newSpace(windowId, msg.name);
     if (msg.type === 'spaces:suggest') return void (result = { name: defaultSpaceName() });
+    if (/^(archive|settings):/.test(msg.type)) {
+      if (msg.type === 'settings:set') await setArchiveAfter(msg.archiveAfterHours);
+      if (msg.type === 'archive:open' && windowId !== undefined) await openArchived(msg.id, windowId);
+      if (msg.type === 'archive:delete') await deleteArchived(msg.id);
+      if (msg.type === 'archive:clear') await clearArchive();
+      let cleared;
+      if (msg.type === 'archive:clear-unpinned' && windowId !== undefined) cleared = await clearUnpinned(windowId);
+      return void (result = { archive: state.archive, settings: state.settings, cleared });
+    }
     if (msg.type === 'spaces:import' && typeof msg.folderId === 'string') await importFolderAsSpace(msg.folderId, windowId);
     if (msg.type === 'spaces:switch' && windowId !== undefined) {
       await switchSpace(windowId, msg.id);
@@ -1373,6 +1634,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true; // respond asynchronously
 });
 
+chrome.alarms?.onAlarm.addListener((alarm) => {
+  if (alarm.name === ARCHIVE_ALARM) run(() => archivePass());
+});
+run(ensureArchiveAlarm); // alarms may not survive a browser restart
+
 chrome.action.onClicked.addListener((tab) => run(() => togglePin(tab)));
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
@@ -1385,6 +1651,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === MENU.newSpace) run(() => openPanel(tab.windowId, true));
   if (info.menuItemId === MENU.nextSpace) run(() => switchSpace(tab.windowId, 1));
   if (info.menuItemId === MENU.manageSpaces) run(() => openPanel(tab.windowId));
+  if (info.menuItemId === MENU.clearUnpinned) run(() => clearUnpinned(tab.windowId));
 });
 
 chrome.commands.onCommand.addListener((command, tab) => {
@@ -1400,6 +1667,8 @@ chrome.commands.onCommand.addListener((command, tab) => {
     if (command === 'prev-space') return switchSpace(tab.windowId, -1);
     if (command === 'new-space') return openPanel(tab.windowId, true);
     if (command === 'manage-spaces') return openPanel(tab.windowId);
+    if (command === 'clear-unpinned') return clearUnpinned(tab.windowId);
+    if (command === 'mru-back') return mruBack(tab.windowId);
     let m = /^goto-fav-(\d)$/.exec(command);
     if (m) return gotoFav(Number(m[1]), tab.windowId);
     m = /^goto-pin-(\d)$/.exec(command);
@@ -1422,4 +1691,9 @@ globalThis.pinline = {
   renameItem: (kind, id, name) => run(() => renameItem(kind, id, name)),
   copyUrl: async (tabId) => copyUrl(await chrome.tabs.get(tabId)),
   syncBookmarks: () => run(syncBookmarks),
+  archivePass: (now) => run(() => archivePass(now)),
+  setArchiveAfter: (hours) => run(() => setArchiveAfter(hours)),
+  clearUnpinned: (windowId) => run(() => clearUnpinned(windowId)),
+  openArchived: (id, windowId) => run(() => openArchived(id, windowId)),
+  mruBack: (windowId) => run(() => mruBack(windowId)),
 };

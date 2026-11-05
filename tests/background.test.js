@@ -963,3 +963,225 @@ test('a Chrome update (onInstalled + onStartup) reconciles only once, after rest
   await fake.settle(bg);
   assert.equal(bg.__test.state.ready, false, 'onInstalled(chrome_update) does not reconcile');
 });
+
+// ---------- auto-archive ----------
+
+const HOUR = 3600_000;
+const archiveUrls = (chrome) => (chrome.storage.local.data.archive ?? []).map((e) => e.url);
+
+test('auto-archive: off by default; tabs not used for N hours are closed into the archive', async () => {
+  const { chrome, strip, bg } = await setup();
+  const pl = globalThis.pinline;
+  const t0 = Date.now();
+  assert.equal(await pl.archivePass(t0 + 100 * HOUR), 0, 'off by default: nothing happens');
+  assert.ok(chrome.alarms.all.get('pinline-archive')?.periodInMinutes === 15, 'alarm every 15 minutes');
+
+  await pl.setArchiveAfter(12);
+  assert.equal(chrome.storage.local.data.settings.archiveAfterHours, 12);
+  await pl.setArchiveAfter(5); // not one of the choices
+  assert.equal(bg.__test.state.settings.archiveAfterHours, 12);
+
+  assert.equal(await pl.archivePass(t0), 0, 'tabs with no record start their clock now');
+  assert.equal(await pl.archivePass(t0 + 11 * HOUR), 0, 'not old enough yet');
+  assert.equal(await pl.archivePass(t0 + 13 * HOUR), 2);
+  assert.deepEqual(await strip(), ['|', GMAIL], 'the selected tab stays');
+  const archive = chrome.storage.local.data.archive;
+  assert.deepEqual(archive.map((e) => e.url).sort(), [DOCS, GH].sort());
+  assert.ok(archive.every((e) => e.spaceId === bg.__test.state.spaces[0].id && e.archivedAt === t0 + 13 * HOUR && e.id && e.title));
+});
+
+test('auto-archive never takes Favs, Pins, the selected tab, tabs playing sound or grouped tabs', async () => {
+  const MUSIC = 'https://music.example.com/';
+  const GROUPED = 'https://grouped.example.com/';
+  const FAV = 'https://fav.example.com/';
+  const old = Date.now() - 48 * HOUR;
+  const { chrome, command, settle, strip } = await setup({
+    tabs: [
+      { id: 1, url: GMAIL, active: true, lastAccessed: old },
+      { id: 2, url: GH, lastAccessed: old },
+      { id: 3, url: DOCS, lastAccessed: old }, // e.g. restored after a restart: only Chrome's lastAccessed is known
+      { id: 4, url: MUSIC, audible: true, lastAccessed: old },
+      { id: 5, url: GROUPED, lastAccessed: old },
+      { id: 6, url: FAV, lastAccessed: old },
+      { id: 7, url: 'https://new.example.com/' }, // no record at all → counts as used now
+    ],
+  });
+  await command('toggle-fav', 6);
+  await command('toggle-pin', 2);
+  await chrome.tabs.group({ tabIds: [5] }); // a tab group below the divider
+  await settle();
+  await globalThis.pinline.setArchiveAfter(12);
+  assert.equal(await globalThis.pinline.archivePass(), 1);
+  await settle();
+  assert.deepEqual(archiveUrls(chrome), [DOCS], 'only the stale normal tab, by Tab.lastAccessed');
+  const s = await strip();
+  assert.deepEqual(s.slice(0, 3), [`F(${FAV})`, `P(${GH})`, '|']);
+  assert.deepEqual(s.slice(3).sort(), [GMAIL, MUSIC, GROUPED, 'https://new.example.com/'].sort());
+});
+
+test('selecting a tab resets its clock; tabs keep their age across a Space round trip', async () => {
+  const { chrome, settle, strip } = await setup();
+  const pl = globalThis.pinline;
+  await pl.setArchiveAfter(12);
+  const t0 = Date.now();
+  await pl.archivePass(t0); // start the clocks
+  await chrome.tabs.update(3, { active: true }); // docs used now, gmail used until now
+  await settle();
+  await pl.newSpace(1);
+  await settle();
+  await pl.switchSpace(1, -1); // back: gmail + github re-opened asleep, docs selected
+  await settle();
+  assert.equal(await pl.archivePass(t0 + 13 * HOUR), 2, 'github and gmail are still 13 h old');
+  await settle();
+  assert.deepEqual(await strip(), ['|', DOCS]);
+});
+
+test('hidden Spaces: saved tabs age out into the archive too', async () => {
+  const { chrome, settle, bg } = await setup();
+  const pl = globalThis.pinline;
+  await pl.setArchiveAfter(24);
+  const s1 = bg.__test.state.spaces[0].id;
+  await pl.newSpace(1); // Space 1 hidden with gmail, github, docs saved
+  await settle();
+  assert.equal(chrome.storage.local.data.spaceTabs[s1].length, 3);
+  assert.equal(await pl.archivePass(Date.now() + 23 * HOUR), 0);
+  assert.equal(await pl.archivePass(Date.now() + 25 * HOUR), 3);
+  assert.deepEqual(chrome.storage.local.data.spaceTabs[s1], []);
+  assert.equal(chrome.storage.local.data.spaceActive[s1], null);
+  assert.deepEqual(archiveUrls(chrome).sort(), [DOCS, GH, GMAIL].sort());
+  assert.ok(chrome.storage.local.data.archive.every((e) => e.spaceId === s1));
+});
+
+test('archive: reopen below the divider (and drop the entry), delete one, clear all', async () => {
+  const { chrome, command, settle, strip } = await setup();
+  await command('toggle-pin', 1);
+  await globalThis.pinline.setArchiveAfter(12);
+  await globalThis.pinline.archivePass();
+  await chrome.tabs.update(1, { active: true });
+  await settle();
+  await globalThis.pinline.archivePass(Date.now() + 13 * HOUR);
+  await settle();
+  assert.deepEqual(await strip(), [`P(${GMAIL})`, '|']);
+  let res = await message(chrome, settle, { type: 'archive:list' });
+  assert.deepEqual(res.archive.map((e) => e.url).sort(), [DOCS, GH].sort());
+  assert.equal(res.settings.archiveAfterHours, 12);
+
+  const gh = res.archive.find((e) => e.url === GH);
+  res = await message(chrome, settle, { type: 'archive:open', id: gh.id, windowId: 1 });
+  await settle();
+  assert.deepEqual(await strip(), [`P(${GMAIL})`, '|', GH]);
+  const [active] = await chrome.tabs.query({ active: true, windowId: 1 });
+  assert.equal(active.url, GH, 'reopened tab is selected');
+  assert.deepEqual(res.archive.map((e) => e.url), [DOCS], 'entry removed from the archive');
+
+  await chrome.tabs.create({ url: 'https://x.example.com/', active: false });
+  await settle();
+  res = await message(chrome, settle, { type: 'archive:delete', id: res.archive[0].id });
+  assert.deepEqual(res.archive, []);
+  await message(chrome, settle, { type: 'archive:clear-unpinned', windowId: 1 });
+  await settle();
+  assert.equal(chrome.storage.local.data.archive.length, 2);
+  res = await message(chrome, settle, { type: 'archive:clear' });
+  assert.deepEqual(res.archive, []);
+  assert.deepEqual(chrome.storage.local.data.archive, []);
+});
+
+test('the archive is capped at 500 entries, newest first', async () => {
+  const { chrome, settle, bg } = await setup();
+  bg.__test.state.archive = Array.from({ length: 500 }, (_, i) => ({ id: `old${i}`, url: `https://o.example.com/${i}`, title: 'o', archivedAt: 1 }));
+  await message(chrome, settle, { type: 'archive:clear-unpinned', windowId: 1 });
+  await settle();
+  const archive = chrome.storage.local.data.archive;
+  assert.equal(archive.length, 500);
+  assert.deepEqual(archive.slice(0, 3).map((e) => e.url), [GMAIL, GH, DOCS]);
+  assert.equal(archive.at(-1).id, 'old496');
+});
+
+// ---------- clear unpinned ----------
+
+test('clear-unpinned archives every tab below the divider and leaves a new tab selected', async () => {
+  const { chrome, command, settle, strip, bg } = await setup();
+  await command('toggle-fav', 3);
+  await command('toggle-pin', 2);
+  await chrome.tabs.update(1, { active: true });
+  await settle();
+  await command('clear-unpinned', 1);
+  assert.deepEqual(await strip(), [`F(${DOCS})`, `P(${GH})`, '|', 'chrome://newtab/']);
+  const [active] = await chrome.tabs.query({ active: true, windowId: 1 });
+  assert.equal(active.url, 'chrome://newtab/');
+  assert.deepEqual(archiveUrls(chrome), [GMAIL]);
+  assert.equal(bg.__test.state.settings.archiveAfterHours, 0, 'works with auto-archive off');
+
+  // From the tab context menu, with only the empty new tab left: nothing to do.
+  chrome.contextMenus.onClicked.emit({ menuItemId: 'pinline-clear-unpinned' }, active);
+  await settle();
+  assert.deepEqual(await strip(), [`F(${DOCS})`, `P(${GH})`, '|', 'chrome://newtab/']);
+  assert.deepEqual(archiveUrls(chrome), [GMAIL]);
+});
+
+test('clear-unpinned while a Pin is selected keeps it selected, no extra tab', async () => {
+  const { chrome, command, settle, strip } = await setup();
+  await command('toggle-pin', 1); // gmail is selected and a Pin
+  await command('clear-unpinned', 1);
+  assert.deepEqual(await strip(), [`P(${GMAIL})`, '|']);
+  assert.equal((await chrome.tabs.get(1)).active, true);
+  assert.deepEqual(archiveUrls(chrome), [GH, DOCS]);
+});
+
+// ---------- recent tabs ----------
+
+const activeId = async (chrome, windowId = 1) => (await chrome.tabs.query({ active: true, windowId }))[0].id;
+
+test('mru-back: goes to the previous tab; repeated presses walk back; the landing tab moves first', async () => {
+  const { chrome, command, settle, bg } = await setup();
+  await chrome.tabs.update(2, { active: true });
+  await settle();
+  await chrome.tabs.update(3, { active: true });
+  await settle();
+  assert.deepEqual(bg.__test.state.mru[1].slice(0, 2), [3, 2]);
+
+  await command('mru-back', 3);
+  assert.equal(await activeId(chrome), 2, '1st press: the previous tab');
+  await command('mru-back', 2);
+  assert.equal(await activeId(chrome), 1, '2nd press (within 1.5 s): one further back');
+  assert.deepEqual(bg.__test.state.mru[1], [3, 2], 'order is not touched mid-walk');
+
+  await sleep(1600);
+  await settle();
+  assert.deepEqual(bg.__test.state.mru[1], [1, 3, 2], 'after the pause the landing tab is first');
+  assert.deepEqual(chrome.storage.session.data.mru[1], [1, 3, 2], 'kept in storage.session');
+
+  await command('mru-back', 1);
+  assert.equal(await activeId(chrome), 3, 'a fresh press goes back to the tab before');
+  await sleep(1600);
+  await settle();
+  assert.deepEqual(bg.__test.state.mru[1], [3, 1, 2]);
+});
+
+test('mru-back skips the divider and closed tabs; clicking a tab mid-walk ends the walk', async () => {
+  const { chrome, command, settle, bg } = await setup();
+  for (const id of [2, 3]) {
+    await chrome.tabs.update(id, { active: true });
+    await settle();
+  }
+  const divider = (await chrome.tabs.query({})).find((t) => t.url.startsWith(DIVIDER));
+  assert.ok(!bg.__test.state.mru[1].includes(divider.id));
+  await chrome.tabs.remove(2);
+  await settle();
+  assert.ok(!bg.__test.state.mru[1].includes(2), 'closed tab dropped');
+  await command('mru-back', 3);
+  assert.equal(await activeId(chrome), 1);
+  await chrome.tabs.update(3, { active: true }); // the user clicks another tab
+  await settle();
+  assert.deepEqual(bg.__test.state.mru[1].slice(0, 2), [3, 1]);
+});
+
+test('MRU list survives a service worker restart (storage.session)', async () => {
+  const { fake, chrome, settle } = await setup();
+  for (const id of [2, 3]) {
+    await chrome.tabs.update(id, { active: true });
+    await settle();
+  }
+  const bg2 = await loadBackground(fake); // a second copy loads state like a woken-up worker
+  assert.deepEqual(bg2.__test.state.mru[1].slice(0, 2), [3, 2]);
+});

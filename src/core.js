@@ -182,3 +182,61 @@ export function displayOrder(pins, groups) {
   for (const g of groups) if (!done.has(g.id)) out.push({ group: g, pins: [] });
   return out;
 }
+
+// ---------- archive (Arc's auto-archive of "Today" tabs) ----------
+
+export const HOUR_MS = 3600_000;
+/** Choices for "archive tabs not used for N hours" (0 = off). */
+export const ARCHIVE_CHOICES = [0, 12, 24, 168, 720];
+export const ARCHIVE_MAX = 500;
+
+/** Not used for at least `hours` (hours = 0: never stale). */
+export function isStale(lastUsed, now, hours) {
+  return hours > 0 && Number.isFinite(lastUsed) && now - lastUsed >= hours * HOUR_MS;
+}
+
+/** New entries go first (newest first), the list is capped at `max`. */
+export function pushArchive(archive, entries, max = ARCHIVE_MAX) {
+  return [...entries, ...archive].slice(0, max);
+}
+
+/** Archive entries whose title or URL contains every word of `query` (case-insensitive). */
+export function filterArchive(archive, query) {
+  const words = String(query ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return archive;
+  return archive.filter((e) => {
+    const hay = `${e.title ?? ''} ${e.url ?? ''}`.toLowerCase();
+    return words.every((w) => hay.includes(w));
+  });
+}
+
+/**
+ * Age out the saved tabs of a hidden Space.
+ * @param items   [{ url, title, seen? }]  `seen` = when the tab was last used (missing: treated as `now`)
+ * @param active  what is selected in that Space ({ pin } | { tab: index } | null)
+ * @returns {{ keep, gone, active }}  `active` re-pointed at the same item (null if it was archived)
+ */
+export function ageOutSaved(items, active, now, hours) {
+  const keep = [];
+  const gone = [];
+  let nextActive = active?.tab === undefined ? active ?? null : null;
+  for (const [i, item] of items.entries()) {
+    const seen = item.seen ?? now;
+    if (isStale(seen, now, hours)) {
+      gone.push(item);
+      continue;
+    }
+    if (active?.tab === i) nextActive = { tab: keep.length };
+    keep.push(item.seen === undefined ? { ...item, seen } : item);
+  }
+  return { keep, gone, active: nextActive };
+}
+
+// ---------- most recently used tabs (Arc's Ctrl+Tab) ----------
+
+export const MRU_MAX = 50;
+
+/** Put a tab at the front of a window's most-recently-used list. */
+export function touchMru(list = [], tabId, max = MRU_MAX) {
+  return [tabId, ...list.filter((id) => id !== tabId)].slice(0, max);
+}
