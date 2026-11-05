@@ -181,13 +181,6 @@ const canKeep = (tab) => !isDivider(tab) && isPinnableUrl(tabUrl(tab));
 const displayTitle = (item) => item.name || item.title || item.url;
 const sleepingUrl = (item) => (isWakeableUrl(item.url) ? sleepUrl(sleepBase(), { url: item.url, title: displayTitle(item) }) : item.url);
 
-const originOf = (url) => {
-  try {
-    return new URL(url).origin;
-  } catch {
-    return null;
-  }
-};
 const getTab = (id) => chrome.tabs.get(id).catch(() => null);
 const windowTabs = async (windowId) =>
   (await chrome.tabs.query({ windowId }).catch(() => [])).sort((a, b) => a.index - b.index);
@@ -1214,14 +1207,19 @@ async function reconcile() {
         if (t.index < divider.index && !t.pinned && !isDivider(t) && !pinIdOf(t.id)) pinCandidates.push([{ ...t, url: tabUrl(t) }, spaceId]);
       }
     } else {
-      // No divider (e.g. Chrome closed it when the extension reloaded): pins sit at the top, so take
-      // the run of leading tabs whose URLs belong to this Space's pins.
-      const urls = state.pins.filter((p) => p.space === spaceId).map((p) => p.url);
-      const sameSite = (a, b) => normalizeUrl(a) === normalizeUrl(b) || originOf(a) === originOf(b);
+      // No divider (e.g. Chrome closed it when the extension reloaded). Bindings normally survive
+      // that, so this only recovers pins whose binding was lost: take the leading tabs that are
+      // exactly the URL of an unbound pin of this Space. Never adopt anything else, and never match
+      // by site: a normal tab on the same site as a pin must stay a normal tab.
+      const bound = new Set(Object.values(state.tabToPin));
+      const free = new Map();
+      for (const p of state.pins) if (p.space === spaceId && !bound.has(p.id)) free.set(normalizeUrl(p.url), p);
       for (const t of tabs.filter((t) => !t.pinned)) {
         if (pinIdOf(t.id)) continue;
-        if (!urls.some((u) => sameSite(u, tabUrl(t)))) break;
-        pinCandidates.push([{ ...t, url: tabUrl(t) }, spaceId]);
+        const pin = free.get(normalizeUrl(tabUrl(t)));
+        if (!pin) break;
+        free.delete(normalizeUrl(tabUrl(t)));
+        state.tabToPin[t.id] = pin.id;
       }
     }
   }

@@ -1215,3 +1215,24 @@ test('switching into a Space collapses its Pin groups, except the one holding th
   await settle();
   assert.equal((await chrome.tabGroups.query({})).find((g) => g.title === 'A').collapsed, false);
 });
+
+test('reloading the extension does not turn same-site normal tabs into pins', async () => {
+  const WIKI = 'https://docs.example.com/wiki/a';
+  const { fake, chrome, command, settle, bg } = await setup({
+    tabs: [{ id: 1, url: GH, active: true }, { id: 2, url: DOCS }, { id: 3, url: WIKI }, { id: 4, url: 'https://github.com/pulls' }],
+  });
+  await command('toggle-pin', 1);
+  await command('toggle-pin', 2);
+  await chrome.tabs.remove(2); // docs pin → sleeping placeholder (an extension page, closed on reload)
+  await settle();
+  // Normal tabs on the same sites as the pins, right below the line.
+  await bmSettle(settle);
+  const before = bg.__test.state.pins.map((p) => p.url).sort();
+  const bg2 = await reload(fake);
+  const { state } = bg2.__test;
+  assert.deepEqual(state.pins.map((p) => p.url).sort(), before, 'no new pins');
+  const tabs = (await chrome.tabs.query({ windowId: 1 })).sort((a, b) => a.index - b.index);
+  const pinnedUrls = tabs.filter((t) => state.tabToPin[t.id]).map(realUrl).sort();
+  assert.deepEqual(pinnedUrls, [DOCS, GH]);
+  assert.ok(!state.tabToPin[3] && !state.tabToPin[4], 'same-site normal tabs stay normal');
+});
