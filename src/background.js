@@ -436,24 +436,35 @@ async function layoutPins(windowId) {
       const has = pinGroupOf(t);
       if (has !== null && (inPinArea ? has !== wanted : !!state.groupMap[t.groupId])) await chrome.tabs.ungroup(t.id).catch(() => {});
     }
-    for (const x of plan.filter((x) => x.group)) {
-      const ids = x.pins.map((p) => tabOf.get(p.id).id);
-      const cid = chromeGroupOf.get(x.group.id);
-      const live = await getChromeGroup(cid);
-      if (live && live.windowId === windowId) {
-        const now = await windowTabs(windowId);
-        const missing = ids.filter((id) => now.find((t) => t.id === id)?.groupId !== cid);
-        if (missing.length) await chrome.tabs.group({ groupId: cid, tabIds: missing });
-      } else {
-        const newId = await chrome.tabs.group({ tabIds: ids, createProperties: { windowId } });
-        state.groupMap[newId] = x.group.id;
-        chromeGroupOf.set(x.group.id, newId);
-        await chrome.tabGroups.update(newId, { title: x.group.title, color: x.group.color, collapsed: x.group.collapsed }).catch(() => {});
-      }
-    }
+    // New groups are created together (fired at once, Chrome runs them in order).
+    const snapshot = await windowTabs(windowId);
+    const groupOfTab = new Map(snapshot.map((t) => [t.id, t.groupId]));
+    const liveGroups = new Map((await chrome.tabGroups.query({ windowId }).catch(() => [])).map((g) => [g.id, g]));
+    await Promise.all(
+      plan
+        .filter((x) => x.group)
+        .map(async (x) => {
+          const ids = x.pins.map((p) => tabOf.get(p.id).id);
+          const cid = chromeGroupOf.get(x.group.id);
+          if (cid !== undefined && liveGroups.has(cid)) {
+            const missing = ids.filter((id) => groupOfTab.get(id) !== cid);
+            if (missing.length) await chrome.tabs.group({ groupId: cid, tabIds: missing });
+            return;
+          }
+          const newId = await chrome.tabs.group({ tabIds: ids, createProperties: { windowId } });
+          state.groupMap[newId] = x.group.id;
+          chromeGroupOf.set(x.group.id, newId);
+          await chrome.tabGroups.update(newId, { title: x.group.title, color: x.group.color, collapsed: x.group.collapsed }).catch(() => {});
+        }),
+    );
 
     // 2. Order, left to right: single pins, then whole groups (and the pins inside), then the divider.
+    // Usually already right (a Space switch opens pins in order): check with one query first.
+    const after = await windowTabs(windowId);
+    const finalIds = [...want.map(([id]) => id), divider.id];
+    const ordered = finalIds.every((id, k) => after[base + k]?.id === id);
     let at = base;
+    if (!ordered) {
     for (const x of plan) {
       if (x.pin) {
         const id = tabOf.get(x.pin.id).id;
@@ -471,6 +482,7 @@ async function layoutPins(windowId) {
       at += x.pins.length;
     }
     if ((await getTab(divider.id))?.index !== at) await chrome.tabs.move(divider.id, { index: at });
+    }
   }
 
   // 3. Names / colours follow the Pin group (changed in the panel or in bookmarks).
@@ -754,34 +766,55 @@ async function switchSpace(windowId, target) {
   if (state.settings.collapseGroupsOnSwitch) {
     for (const g of state.groups.filter((g) => g.space === targetId)) g.collapsed = showPin?.group !== g.id;
   }
-  const open = async (item, isShown) => {
-    const tab = await createSelf({ windowId, url: isShown ? item.url : sleepingUrl(item), active: isShown });
+  const open = async (item, isShown, index) => {
+    const props = { windowId, url: isShown ? item.url : sleepingUrl(item), active: isShown };
+    if (index !== undefined) props.index = index;
+    const tab = await createSelf(props);
     if (!isShown) pendingDiscard.add(tab.id);
     if (!item.space) state.lastSeen[tab.id] = isShown ? Date.now() : item.seen ?? Date.now(); // its age carries over
     if (!isShown && !item.space && isWakeableUrl(item.url)) state.sleepers[tab.id] = { w: windowId, url: item.url, title: item.title };
     return tab;
   };
-  for (const pin of pins) {
-    const tab = await open(pin, pin === showPin);
+  const openPin = async (pin, index) => {
+    const tab = await open(pin, pin === showPin, index);
     state.tabToPin[tab.id] = pin.id;
-  }
-  await createSelf({ windowId, url: dividerFor(space), active: false });
-  for (const [i, item] of items.entries()) await open(item, i === showTab);
-  if (!showPin && showTab < 0) await createSelf({ windowId, url: 'chrome://newtab/', active: true });
-  state.windowSpace[windowId] = targetId;
-  delete state.spaceTabs[targetId];
+  };
 
-  // 3. Close the old Space's tabs (its pins are saved in state.pins, they come back next time).
-  // Saved first: if the browser dies between the two steps the tabs are not lost.
+  // Calls below are fired together instead of one by one: Chrome runs them in order, so tabs still
+  // line up. Pins go in display order (groups already together) right after the Favs, so the
+  // final layout pass has little to move.
+  const base = tabs.filter((t) => t.pinned).length;
+  const ordered = displayOrder(pins, state.groups.filter((g) => g.space === targetId)).flatMap((x) => (x.pin ? [x.pin] : x.pins));
+  state.windowSpace[windowId] = targetId;
+
+  // 1. The tab to show comes first, so the window shows the new Space right away.
+  const shownItem = showTab >= 0 ? items[showTab] : null;
+  let shownTab = null;
+  if (showPin) await openPin(showPin, base + ordered.indexOf(showPin));
+  else if (shownItem) shownTab = await open(shownItem, true);
+  else await createSelf({ windowId, url: 'chrome://newtab/', active: true });
+
+  // 2. Save, then close the old Space's tabs while the new ones are being opened.
+  // (The target's saved tabs stay stored until they are open again.)
   await chrome.storage.local.set({ spaceTabs: state.spaceTabs, spaceActive: state.spaceActive });
   for (const t of outgoing) {
     delete state.tabToPin[t.id];
     delete state.sleepers[t.id];
     switchClosing.add(t.id);
   }
-  await chrome.tabs.remove(outgoing.map((t) => t.id)).catch(async () => {
+  const closing = chrome.tabs.remove(outgoing.map((t) => t.id)).catch(async () => {
     for (const t of outgoing) await chrome.tabs.remove(t.id).catch(() => switchClosing.delete(t.id));
   });
+  const opening = Promise.all([
+    ...ordered.map((pin, i) => (pin === showPin ? null : openPin(pin, base + i))),
+    createSelf({ windowId, url: dividerFor(space), active: false, index: base + ordered.length }),
+    ...items.map((item, i) => (i === showTab ? null : open(item, false))),
+  ]);
+  await Promise.all([closing, opening]);
+  delete state.spaceTabs[targetId];
+  await chrome.storage.local.set({ spaceTabs: state.spaceTabs });
+  // The shown tab was opened first, at the end: put it back in its place among the tabs.
+  if (shownTab) await chrome.tabs.move(shownTab.id, { index: base + ordered.length + 1 + showTab }).catch(() => {});
   await layout(windowId);
   switchingUntil = Date.now() + SWITCH_GRACE_MS;
 }
