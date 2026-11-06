@@ -1178,8 +1178,14 @@ async function renameItem(kind, id, name) {
 /** Favs and the shown Space's Pins, for the panel's name list. */
 async function listItems(windowId) {
   const spaceId = windowId !== undefined && (await isNormalWindow(windowId)) ? spaceOfWindow(windowId, await windowTabs(windowId)) : null;
-  const view = (kind) => (it) => ({ kind, id: it.id, url: it.url, title: it.title, name: it.name ?? '' });
+  const view = (kind) => (it) => ({ kind, id: it.id, url: it.url, title: it.title, name: it.name ?? '', group: it.group ?? null });
   return [...state.favs.map(view('fav')), ...state.pins.filter((p) => p.space === spaceId).map(view('pin'))];
+}
+
+/** Pin groups of the window's shown Space, for the panel's name tree. */
+async function listGroups(windowId) {
+  const spaceId = windowId !== undefined && (await isNormalWindow(windowId)) ? spaceOfWindow(windowId, await windowTabs(windowId)) : null;
+  return state.groups.filter((g) => g.space === spaceId).map((g) => ({ id: g.id, title: g.title, color: g.color }));
 }
 
 /** Data for the "Manage Spaces" page. */
@@ -1672,6 +1678,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     result = {
       spaces: await listSpaces(windowId),
       items: await listItems(windowId),
+      groups: await listGroups(windowId),
       canRetitle: await canRetitle(),
       bookmarkRoot: state.bm.root ?? null,
     };

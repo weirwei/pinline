@@ -59,10 +59,25 @@
     td:last-child { text-align: right; color: var(--muted); }
     td kbd { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--fg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
     tr:last-child td { border-bottom: none; }
-    #names td { text-align: left; color: inherit; }
-    #names td.kind { width: 34px; color: var(--muted); font-size: 12px; }
-    #names input { width: 100%; }
-    #names tr.focus input { outline: 2px solid var(--accent); }
+    /* Fav / Pin name tree */
+    .tree, .tree ul { list-style: none; margin: 0; padding: 0; }
+    .tree ul { margin-left: 9px; padding-left: 12px; border-left: 1px solid var(--line); }
+    .tree > li + li { margin-top: 6px; }
+    .tree summary { display: flex; gap: 8px; align-items: center; padding: 4px 6px; border-radius: 6px; cursor: pointer; user-select: none; font-weight: 600; font-size: 13px; }
+    .tree summary:hover { background: var(--bg); }
+    .tree summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
+    .tree summary { list-style: none; }
+    .tree summary::-webkit-details-marker { display: none; }
+    .tree summary::before { content: '▸'; flex: none; width: 12px; color: var(--muted); font-size: 15px; line-height: 1; transition: transform .12s; }
+    .tree details[open] > summary::before { transform: rotate(90deg); }
+    .tree summary .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tree summary .count { margin-left: auto; color: var(--muted); font-weight: 400; font-size: 12px; }
+    .tree .gdot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+    .tree .leaf { display: grid; grid-template-columns: 16px 1fr; gap: 8px; align-items: center; padding: 3px 0; }
+    .tree .leaf img { width: 16px; height: 16px; }
+    .tree .leaf input { width: 100%; }
+    .tree .leaf.focus input { outline: 2px solid var(--accent); }
+    .tree .none { color: var(--muted); font-size: 12px; padding: 3px 0; }
     /* Archive */
     #archive { list-style: none; margin: 8px 0 0; padding: 0; max-height: 360px; overflow: auto; }
     #archive li { display: grid; grid-template-columns: 1fr auto; gap: 4px; align-items: center; border-bottom: 1px solid var(--line); }
@@ -137,7 +152,7 @@
           已加载的网页要显示新名字，需要一次「所有网站」权限（脚本只在你改过名的网站上运行，可随时收回）。没有权限时，名字只在休眠时显示。
           <button class="btn" id="grant" type="button">授权</button>
         </p>
-        <table><tbody id="names"></tbody></table>
+        <ul id="names" class="tree" aria-label="Fav / Pin"></ul>
       </section>
 
       <section class="card" aria-labelledby="bm-title">

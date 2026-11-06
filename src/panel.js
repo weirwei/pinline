@@ -8,6 +8,7 @@ const $ = (id) => document.getElementById(id);
 
 let spaces = [];
 let items = [];
+let groups = [];
 let canRetitle = false;
 let bookmarkRoot = null;
 let selectedId = null; // the Space shown on the right; clicking a Space selects it, it does not switch
@@ -75,6 +76,7 @@ async function refresh() {
   if (!res) return;
   spaces = res.spaces;
   items = res.items ?? [];
+  groups = res.groups ?? [];
   canRetitle = !!res.canRetitle;
   bookmarkRoot = res.bookmarkRoot;
   renderNames();
@@ -89,7 +91,7 @@ function switchTo(space) {
 }
 
 document.addEventListener('keydown', (e) => {
-  if ((e.target instanceof Element && e.target.closest('input, select, textarea, button')) || e.metaKey || e.ctrlKey || e.altKey) return;
+  if ((e.target instanceof Element && e.target.closest('input, select, textarea, button, summary')) || e.metaKey || e.ctrlKey || e.altKey) return;
   const n = Number(e.key);
   if (n >= 1 && n <= 9 && spaces[n - 1]) select(spaces[n - 1]);
   if (e.key === 'Enter') switchTo(selected());
@@ -183,31 +185,79 @@ function renderPerm() {
   $('perm').hidden = canRetitle || !items.some((i) => i.name);
 }
 
+const closedBranches = new Set(); // branches the user folded, kept across re-renders
+const GROUP_COLOR = { grey: '#5f6368', blue: '#1a73e8', red: '#d93025', yellow: '#f9ab00', green: '#188038', pink: '#d01884', purple: '#a142f4', cyan: '#007b83', orange: '#fa903e' };
+
+function leaf(item) {
+  const li = document.createElement('li');
+  li.className = 'leaf';
+  li.dataset.key = `${item.kind}:${item.id}`;
+  const img = Object.assign(document.createElement('img'), { src: favicon(item.url), alt: '' });
+  const input = Object.assign(document.createElement('input'), { value: item.name, placeholder: item.title || item.url, maxLength: 80, title: item.url });
+  input.setAttribute('aria-label', `${item.title || item.url} 的名称`);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') saveName(item, input).then(() => input.blur());
+    if (e.key === 'Escape') {
+      input.value = item.name;
+      input.blur();
+    }
+  });
+  input.addEventListener('change', () => saveName(item, input));
+  li.append(img, input);
+  return li;
+}
+
+/** A foldable node: <details> with a label, a count and its children. */
+function branch(key, label, count, children, dot) {
+  const li = document.createElement('li');
+  const details = document.createElement('details');
+  details.open = !closedBranches.has(key);
+  details.dataset.branch = key;
+  details.addEventListener('toggle', () => (details.open ? closedBranches.delete(key) : closedBranches.add(key)));
+  const summary = document.createElement('summary');
+  if (dot) summary.append(Object.assign(document.createElement('span'), { className: 'gdot', style: `background:${dot}` }));
+  summary.append(Object.assign(document.createElement('span'), { className: 'label', textContent: label }));
+  summary.append(Object.assign(document.createElement('span'), { className: 'count', textContent: String(count) }));
+  const ul = document.createElement('ul');
+  if (children.length) ul.append(...children);
+  else ul.append(Object.assign(document.createElement('li'), { className: 'none', textContent: '空' }));
+  details.append(summary, ul);
+  li.append(details);
+  return li;
+}
+
 function renderNames() {
   renderPerm();
   if ($('names').contains(document.activeElement)) return; // don't clobber what is being typed
+  const favs = items.filter((i) => i.kind === 'fav');
+  const pins = items.filter((i) => i.kind === 'pin');
+
+  // Pins keep their order; a group sits where its first pin is.
+  const groupOf = new Map(groups.map((g) => [g.id, g]));
+  const pinNodes = [];
+  const grouped = new Map();
+  for (const pin of pins) {
+    const g = pin.group && groupOf.get(pin.group);
+    if (!g) {
+      pinNodes.push(leaf(pin));
+      continue;
+    }
+    if (!grouped.has(g.id)) {
+      grouped.set(g.id, []);
+      pinNodes.push(g.id); // placeholder, replaced below
+    }
+    grouped.get(g.id).push(leaf(pin));
+  }
+  const pinChildren = pinNodes.map((n) => {
+    if (typeof n !== 'string') return n;
+    const g = groupOf.get(n);
+    return branch(`group:${n}`, g.title || '未命名分组', grouped.get(n).length, grouped.get(n), GROUP_COLOR[g.color] ?? GROUP_COLOR.grey);
+  });
+
   $('names').replaceChildren(
-    ...items.map((item) => {
-      const tr = document.createElement('tr');
-      tr.dataset.key = `${item.kind}:${item.id}`;
-      const kind = Object.assign(document.createElement('td'), { className: 'kind', textContent: item.kind === 'fav' ? 'Fav' : 'Pin' });
-      const cell = document.createElement('td');
-      const input = Object.assign(document.createElement('input'), { value: item.name, placeholder: item.title || item.url, maxLength: 80 });
-      input.setAttribute('aria-label', `${item.title || item.url} 的名称`);
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') saveName(item, input).then(() => input.blur());
-        if (e.key === 'Escape') {
-          input.value = item.name;
-          input.blur();
-        }
-      });
-      input.addEventListener('change', () => saveName(item, input));
-      cell.append(input);
-      tr.append(kind, cell);
-      return tr;
-    }),
+    branch('fav', '⭐ Fav', favs.length, favs.map(leaf)),
+    branch('pins', current()?.name ?? 'Pin', pins.length, pinChildren),
   );
-  if (!items.length) $('names').replaceChildren(Object.assign(document.createElement('tr'), { innerHTML: '<td class="kind"></td><td>还没有 Fav / Pin</td>' }));
 }
 
 $('grant').addEventListener('click', async () => {
@@ -221,8 +271,9 @@ function focusRenameIfAsked() {
   const m = /^#rename=(.+)$/.exec(location.hash);
   if (!m) return;
   history.replaceState(null, '', location.pathname + location.search);
-  const row = $('names').querySelector(`tr[data-key="${CSS.escape(decodeURIComponent(m[1]))}"]`);
+  const row = $('names').querySelector(`li[data-key="${CSS.escape(decodeURIComponent(m[1]))}"]`);
   if (!row) return;
+  for (let d = row.closest('details'); d; d = d.parentElement?.closest('details')) d.open = true;
   row.classList.add('focus');
   const input = row.querySelector('input');
   input.focus();
@@ -367,7 +418,7 @@ $('edit-keys').addEventListener('click', () => chrome.tabs.create({ url: 'chrome
 // ---------- start ----------
 
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && (changes.spaces || changes.spaceTabs || changes.pins || changes.favs)) refresh();
+  if (area === 'local' && (changes.spaces || changes.spaceTabs || changes.pins || changes.favs || changes.groups)) refresh();
   if (area === 'local' && (changes.archive || changes.settings)) refreshArchive();
 });
 document.addEventListener('visibilitychange', () => {

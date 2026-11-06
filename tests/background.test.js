@@ -827,6 +827,18 @@ test('list for the panel: Favs and the shown Space pins, with names', async () =
   assert.equal(res.canRetitle, false);
 });
 
+test('list for the panel: pins carry their group; the shown Space groups come along', async () => {
+  const { chrome, command, settle, bg } = await setup();
+  await command('toggle-pin', 1);
+  await command('toggle-pin', 2);
+  await command('toggle-pin', 3);
+  await pinsInGroup(chrome, command, settle, '文档', 2, 3);
+  const res = await message(chrome, settle, { type: 'spaces:list', windowId: 1 });
+  const g = bg.__test.state.groups[0];
+  assert.deepEqual(res.groups, [{ id: g.id, title: '文档', color: g.color }]);
+  assert.deepEqual(res.items.map((i) => [i.url, i.group]), [['https://mail.google.com/', null], [GH, g.id], [DOCS, g.id]]);
+});
+
 // ---------- restart races ----------
 
 test('a pinned tab restored after reconcile binds to its Fav instead of creating a duplicate', async () => {
