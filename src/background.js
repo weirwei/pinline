@@ -36,6 +36,7 @@ import {
   touchMru,
 } from './core.js';
 import { ROOT_TITLE, mergeFromBookmarks, mirrorToBookmarks, snapshot } from './bookmarks.js';
+import { CMDBAR_ID, CMDBAR_PROTOCOL, cmdbarCommands, parseCmdbarMessage } from './cmdbar.js';
 
 // Bind the API object once: timers that fire late keep talking to the browser they started with.
 const chrome = globalThis.chrome;
@@ -1684,6 +1685,96 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     };
   }).then(() => sendResponse(result ?? { error: 'failed' }));
   return true; // respond asynchronously
+});
+
+// ---------- Arc Cmdbar (another extension) ----------
+// It lists our commands in its search box and runs them here. Only that extension id is accepted
+// (also restricted by `externally_connectable` in the manifest).
+
+/** What the command bar needs: commands for its target tab, and what our special tabs really are. */
+async function cmdbarList(tabId, windowId) {
+  const tab = tabId !== undefined ? await getTab(tabId) : null;
+  windowId ??= tab?.windowId;
+  let tabView = null;
+  if (tab) {
+    const item = itemOf(tab);
+    const role = isDivider(tab) ? 'divider' : favIdOf(tab.id) ? 'fav' : pinIdOf(tab.id) ? 'pin' : null;
+    tabView = {
+      role,
+      keepable: canKeep(tab),
+      awayFromHome: !!item && isOpenableUrl(item.url) && normalizeUrl(tabUrl(tab)) !== normalizeUrl(item.url),
+    };
+  }
+  const spaces = windowId !== undefined ? await listSpaces(windowId) : [];
+  // Our tabs as the command bar should show them: real URL of sleeping placeholders, Fav / Pin names, dividers hidden.
+  const tabs = {};
+  for (const id of await normalWindowIds()) {
+    for (const t of await windowTabs(id)) {
+      const fav = favById(favIdOf(t.id));
+      const pin = pinById(pinIdOf(t.id));
+      if (isDivider(t)) tabs[t.id] = { role: 'divider' };
+      else if (fav || pin) tabs[t.id] = { role: fav ? 'fav' : 'pin', id: (fav ?? pin).id, url: tabUrl(t), name: (fav ?? pin).name || '' };
+      else if (isPlaceholder(t)) tabs[t.id] = { role: null, url: tabUrl(t) };
+    }
+  }
+  return {
+    protocol: CMDBAR_PROTOCOL,
+    commands: cmdbarCommands({ tab: tabView, spaces, archive: state.archive }),
+    tabs,
+  };
+}
+
+async function cmdbarRun(id, tabId, windowId) {
+  const tab = tabId !== undefined ? await getTab(tabId) : null;
+  windowId ??= tab?.windowId;
+  const win = windowId !== undefined && (await isNormalWindow(windowId)) ? windowId : undefined;
+  const needTab = (fn) => (tab ? fn(tab) : Promise.reject(new Error('no tab')));
+  const needWin = (fn) => (win !== undefined ? fn(win) : Promise.reject(new Error('no window')));
+  const simple = {
+    'toggle-fav': () => needTab(toggleFav),
+    'toggle-pin': () => needTab(togglePin),
+    'reset-pin': () => needTab(resetToHome),
+    'set-pin-home': () => needTab(setHome),
+    rename: () => needTab(openRename),
+    'next-space': () => needWin((w) => switchSpace(w, 1)),
+    'prev-space': () => needWin((w) => switchSpace(w, -1)),
+    'new-space': () => needWin((w) => openPanel(w, true)),
+    'manage-spaces': () => needWin((w) => openPanel(w)),
+    'clear-unpinned': () => needWin(clearUnpinned),
+    'mru-back': () => needWin(mruBack),
+  };
+  if (Object.hasOwn(simple, id)) return void (await simple[id]());
+  let m = /^space:(.+)$/.exec(id);
+  if (m) {
+    if (!spaceById(m[1])) throw new Error('no such Space');
+    return needWin(async (w) => {
+      await switchSpace(w, m[1]);
+      await chrome.windows.update(w, { focused: true }).catch(() => {});
+    });
+  }
+  m = /^archive:(.+)$/.exec(id);
+  if (m) {
+    if (!state.archive.some((e) => e.id === m[1])) throw new Error('no such archived tab');
+    return needWin((w) => openArchived(m[1], w));
+  }
+  throw new Error(`unknown command: ${id}`);
+}
+
+chrome.runtime.onMessageExternal?.addListener((raw, sender, sendResponse) => {
+  if (sender.id !== CMDBAR_ID) return;
+  const msg = parseCmdbarMessage(raw);
+  if (!msg) return void sendResponse({ error: 'bad request' });
+  let result;
+  run(async () => {
+    try {
+      result = msg.type === 'cmdbar:list'
+        ? await cmdbarList(msg.tabId, msg.windowId)
+        : (await cmdbarRun(msg.id, msg.tabId, msg.windowId), { ok: true });
+    } catch (e) {
+      result = { error: String(e?.message || e) };
+    }
+  }).then(() => sendResponse(result ?? { error: 'failed' }));
+  return true;
 });
 
 chrome.alarms?.onAlarm.addListener((alarm) => {

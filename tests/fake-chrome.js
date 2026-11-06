@@ -182,6 +182,7 @@ export function createFakeChrome({ tabs: initialTabs = [], local = {}, sync = {}
       onInstalled: event(),
       onStartup: event(),
       onMessage: event(),
+      onMessageExternal: event(),
       id: 'fakeid',
       lastError: undefined,
       getURL: (path) => `chrome-extension://fakeid/${path.replace(/^\//, '')}`,
