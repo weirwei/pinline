@@ -6,8 +6,9 @@
   "type": "module",
   "scripts": {
     "test": "node --test tests/",
-    "zip": "rm -f pinline.zip && zip -r pinline.zip manifest.json src -x '*.DS_Store'",
-    "e2e": "node e2e/run.mjs && node e2e/retitle.mjs"
+    "zip": "node scripts/zip.mjs",
+    "e2e": "node e2e/run.mjs && node e2e/retitle.mjs",
+    "icons": "node scripts/icons.mjs"
   },
   "license": "MIT"
 }

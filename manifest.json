@@ -5,6 +5,12 @@
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtBj6AmJ5d3X0EjgLOKm7i9UUhod9LcJTwo8MdTfBiCFe+C45YQSfdpSsb+YcAsi9blV57RXQN6FmuRhev3xdYDy0hqXzxmmUNLSVgichgSmVMGO5s6q91NC5KbiNoe4ipDFkDUhTfe7iVDmtxruuN+IDs+lxcsQP/uf9jqEJ9EMvrnEkycEU3to8jrdhaMr9Lg3zFJEaEw8+Am+/Ijw1C48CASmzyKtxrxhqgHVImtQHr6tldjkaiiks/Pi/PU/Sm1IgGvMrO3QVsd1tt82Zdm3+WwdyiGvwa+7X/QHHNMPm+jOmnAmCbcaD8FSH3AH5PbJ92W+DcValmWnDGXaQBwIDAQAB",
   "description": "Arc-style Favs, Pins and shortcuts for Chrome's native vertical tabs.",
   "minimum_chrome_version": "123",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
   "permissions": [
     "tabs",
     "storage",
@@ -22,7 +28,12 @@
     "type": "module"
   },
   "action": {
-    "default_title": "Pinline: pin / unpin current tab"
+    "default_title": "Pinline: pin / unpin current tab",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png"
+    }
   },
   "commands": {
     "copy-url": {

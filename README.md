@@ -48,8 +48,11 @@ P  文档
 ```bash
 npm test                                   # 单元测试（模拟 chrome API）
 CHROME_BIN="/path/to/Google Chrome for Testing" npm run e2e   # 真浏览器端到端（含改名：用一份预授权所有网站的临时副本）
-npm run zip                                # 打包
+npm run zip                                # 打包上架用的 zip（自动去掉 manifest 的 key）
+CHROME_HEADLESS="/path/to/chrome-headless-shell" npm run icons  # 从 icons/icon.svg 重新生成 PNG 图标
 ```
+
+商店要填的说明和权限用途见 `store/listing.md`。
 
 正式版 Chrome 不支持 `--load-extension`，e2e 需要 [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/)。
 
