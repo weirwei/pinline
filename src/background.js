@@ -79,8 +79,19 @@ let switchingUntil = 0;
 
 // All handlers run one at a time so state never interleaves.
 let queue = loadState();
-function run(task) {
-  queue = queue.then(task).catch((err) => console.error('[pinline]', err));
+// While the user drags a tab, Chrome rejects every tab edit (move / update / group...).
+// Handlers re-read the live tabs, so just run the same task again once the drag is over.
+const DRAG_RETRY_MS = 300;
+const DRAG_RETRY_MAX = 40; // ~12 s, longer than any reasonable drag
+const isDragError = (err) => /user may be dragging a tab/i.test(String(err?.message ?? err));
+function run(task, attempt = 0) {
+  queue = queue.then(task).catch((err) => {
+    if (isDragError(err) && attempt < DRAG_RETRY_MAX) {
+      setTimeout(() => run(task, attempt + 1), DRAG_RETRY_MS);
+      return;
+    }
+    console.error('[pinline]', err);
+  });
   return queue;
 }
 
