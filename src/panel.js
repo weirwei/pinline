@@ -392,6 +392,35 @@ $('clear-unpinned').addEventListener('click', async () => {
   say(res?.cleared ? `已归档 ${res.cleared} 个标签` : '分割线下方没有要归档的标签');
 });
 
+// ---------- backups ----------
+
+function renderBackups(res) {
+  const list = res?.backups ?? [];
+  if (!list.length) {
+    return $('backups').replaceChildren(Object.assign(document.createElement('li'), { className: 'empty', textContent: '还没有备份' }));
+  }
+  $('backups').replaceChildren(
+    ...list.map((b) => {
+      const li = document.createElement('li');
+      const when = new Date(b.at).toLocaleString('zh-CN', { hour12: false });
+      const text = Object.assign(document.createElement('span'), {
+        textContent: `${when}（${ago(b.at)}）· ${b.spaces} 个 Space · ${b.favs} Fav · ${b.pins} Pin`,
+      });
+      const btn = Object.assign(document.createElement('button'), { className: 'btn', type: 'button', textContent: '恢复' });
+      btn.addEventListener('click', async () => {
+        if (!confirm(`恢复到 ${when} 的备份？当前的 Space / Fav / Pin 会被替换（其他电脑也会跟着变）。`)) return;
+        say('正在恢复…');
+        const r = await send({ type: 'backup:restore', at: b.at });
+        renderBackups(r);
+        say(r?.ok ? `已恢复到 ${when} 的备份` : '恢复失败');
+      });
+      li.append(text, btn);
+      return li;
+    }),
+  );
+}
+const refreshBackups = async () => renderBackups(await send({ type: 'backup:list' }));
+
 // ---------- shortcuts ----------
 
 async function renderKeys() {
@@ -420,16 +449,18 @@ $('edit-keys').addEventListener('click', () => chrome.tabs.create({ url: 'chrome
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && (changes.spaces || changes.spaceTabs || changes.pins || changes.favs || changes.groups)) refresh();
   if (area === 'local' && (changes.archive || changes.settings)) refreshArchive();
+  if (area === 'local' && changes.backups) refreshBackups();
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     refresh();
     refreshArchive();
+    refreshBackups();
     renderKeys();
   }
 });
 
 await refresh();
-await Promise.all([suggestName(), renderKeys(), loadFolders(), refreshArchive()]);
+await Promise.all([suggestName(), renderKeys(), loadFolders(), refreshArchive(), refreshBackups()]);
 focusNewIfAsked();
 focusRenameIfAsked();

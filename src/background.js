@@ -509,6 +509,9 @@ async function layoutPins(windowId) {
 }
 
 async function layout(windowId) {
+  // A window still being filled in (maybe restored) waits for rebindWindow(): laying it out now
+  // would take its not-yet-bound pins for normal tabs.
+  if (settlingWindows.has(windowId)) return;
   if (!(await isNormalWindow(windowId))) return;
   await layoutFavs(windowId);
   await layoutPins(windowId);
@@ -863,7 +866,7 @@ async function renameSpace(spaceId, name) {
  * Delete a Space with its pins and saved tabs. Windows showing it switch to a neighbour first
  * (closing its tabs). The last Space cannot be deleted.
  */
-async function deleteSpace(spaceId) {
+async function deleteSpace(spaceId, trash = true) {
   if (!spaceById(spaceId) || state.spaces.length < 2) return;
   const i = state.spaces.findIndex((s) => s.id === spaceId);
   const fallback = state.spaces[i === 0 ? 1 : i - 1].id;
@@ -871,7 +874,7 @@ async function deleteSpace(spaceId) {
     if (spaceOfWindow(w, await windowTabs(w)) === spaceId) await switchSpace(w, fallback);
   }
   const gone = spaceById(spaceId);
-  if (gone?.bm) state.bmTrash.push(gone.bm); // removes its pins' bookmarks too
+  if (gone?.bm && trash) state.bmTrash.push(gone.bm); // removes its pins' bookmarks too
   state.spaces = state.spaces.filter((s) => s.id !== spaceId);
   for (const pin of state.pins.filter((p) => p.space === spaceId)) forgetPin(pin.id, false);
   state.groups = state.groups.filter((g) => g.space !== spaceId);
@@ -1029,6 +1032,114 @@ async function ensureArchiveAlarm() {
   if (!a || a.periodInMinutes !== ARCHIVE_EVERY_MIN) {
     await chrome.alarms.create(ARCHIVE_ALARM, { delayInMinutes: ARCHIVE_EVERY_MIN, periodInMinutes: ARCHIVE_EVERY_MIN });
   }
+}
+
+// ---------- backups ----------
+//
+// Every 3 days a copy of Spaces / Favs / Pins / groups goes into storage.local (this device only, so
+// a bad change synced through bookmarks cannot reach it). The 2 newest are kept. The alarm only
+// checks the age of the newest backup: alarms do not reliably survive a browser restart.
+
+const BACKUP_ALARM = 'pinline-backup';
+const BACKUP_CHECK_MIN = 6 * 60;
+const BACKUP_EVERY_MS = 3 * 24 * 3600 * 1000;
+const BACKUP_KEEP = 2;
+
+async function ensureBackupAlarm() {
+  if (!chrome.alarms) return;
+  const a = await chrome.alarms.get(BACKUP_ALARM).catch(() => null);
+  if (!a || a.periodInMinutes !== BACKUP_CHECK_MIN) {
+    await chrome.alarms.create(BACKUP_ALARM, { delayInMinutes: 1, periodInMinutes: BACKUP_CHECK_MIN });
+  }
+}
+
+const loadBackups = async () => (await chrome.storage.local.get('backups')).backups ?? [];
+
+/** Take a backup if the newest one is 3 days old (or there is none). Returns whether it did. */
+async function backupPass(now = Date.now(), force = false) {
+  if (!state.ready) return false;
+  const backups = await loadBackups();
+  if (!force && backups[0] && now - backups[0].at < BACKUP_EVERY_MS) return false;
+  const { spaces, favs, pins, groups, bm, spaceTabs, spaceActive } = state;
+  const copy = structuredClone({ spaces, favs, pins, groups, bm, spaceTabs, spaceActive });
+  await chrome.storage.local.set({ backups: [{ at: now, ...copy }, ...backups].slice(0, BACKUP_KEEP) });
+  return true;
+}
+
+async function listBackups() {
+  return (await loadBackups()).map((b) => ({ at: b.at, spaces: b.spaces.length, favs: b.favs.length, pins: b.pins.length }));
+}
+
+/**
+ * Replace Spaces / Favs / Pins / groups with a backup, here and (through bookmarks) on other devices.
+ * Bookmarks that still fit the backup are kept; everything else in the Pinline folder is deleted
+ * and re-written from the backup.
+ */
+async function restoreBackup(at) {
+  const b = (await loadBackups()).find((x) => x.at === at);
+  if (!b || !b.spaces?.length) return false;
+  await backupPass(Date.now(), true); // the state being replaced can be restored too
+  const data = structuredClone(b);
+
+  // Tabs: Favs that are not in the backup stop being Favs; pins that are not, become normal tabs.
+  const favIds = new Set(data.favs.map((f) => f.id));
+  for (const f of state.favs.filter((f) => !favIds.has(f.id))) await removeFav(f.id, undefined, false);
+  const pinIds = new Set(data.pins.map((p) => p.id));
+  for (const [tabId, pinId] of Object.entries(state.tabToPin)) if (!pinIds.has(pinId)) delete state.tabToPin[tabId];
+  const groupIds = new Set(data.groups.map((g) => g.id));
+  for (const [cid, gid] of Object.entries(state.groupMap)) if (!groupIds.has(gid)) delete state.groupMap[cid];
+
+  Object.assign(state, { spaces: data.spaces, favs: data.favs, pins: data.pins, groups: data.groups });
+  state.spaceTabs = { ...state.spaceTabs, ...data.spaceTabs };
+  state.spaceActive = { ...state.spaceActive, ...data.spaceActive };
+  for (const k of Object.keys(state.spaceTabs)) if (!spaceById(k)) delete state.spaceTabs[k];
+  for (const k of Object.keys(state.spaceActive)) if (!spaceById(k)) delete state.spaceActive[k];
+  ensureSpaces();
+
+  // Bookmarks: keep a bookmark only where the backup expects it, trash the rest.
+  const root = chrome.bookmarks ? await subtree(state.bm.root) : null;
+  if (root && !root.url) {
+    const nodes = new Map();
+    const walk = (n) => (nodes.set(n.id, n), (n.children ?? []).forEach(walk));
+    walk(root);
+    const keep = new Set([root.id]);
+    const fits = (id, parent, folder) => {
+      const n = nodes.get(id);
+      return !!n && keep.has(parent) && n.parentId === parent && !n.url === folder && !keep.has(id);
+    };
+    if (!fits(state.bm.fav, root.id, true)) state.bm.fav = undefined;
+    else keep.add(state.bm.fav);
+    const claim = (item, parent, folder) => {
+      if (item.bm && fits(item.bm, parent, folder)) keep.add(item.bm);
+      else item.bm = undefined;
+    };
+    for (const s of state.spaces) claim(s, root.id, true);
+    const spaceBm = new Map(state.spaces.map((s) => [s.id, s.bm]));
+    for (const g of state.groups) claim(g, spaceBm.get(g.space), true);
+    const groupBm = new Map(state.groups.map((g) => [g.id, g.bm]));
+    for (const f of state.favs) claim(f, state.bm.fav, false);
+    for (const p of state.pins) claim(p, p.group ? groupBm.get(p.group) : spaceBm.get(p.space), false);
+    // Top-most nodes not kept (their whole subtree goes with them).
+    const trash = (n) => (keep.has(n.id) ? (n.children ?? []).forEach(trash) : state.bmTrash.push(n.id));
+    (root.children ?? []).forEach(trash);
+    // The bookmarks are taken as already merged, so only the trash and the backup are written out.
+    bmBase = snapshot(root);
+  } else {
+    for (const it of [...state.favs, ...state.pins, ...state.spaces, ...state.groups]) it.bm = undefined;
+  }
+  await persist();
+  await syncBookmarks();
+
+  // Re-open the restored pins in the windows showing their Space.
+  const windows = await normalWindowIds();
+  for (const w of windows) state.windowSpace[w] = spaceOfWindow(w, await windowTabs(w));
+  const bound = new Set(Object.values(state.tabToPin));
+  for (const pin of state.pins) {
+    const where = windows.find((w) => state.windowSpace[w] === pin.space);
+    if (where && !bound.has(pin.id)) await recreatePin(pin, where);
+  }
+  await layoutAll();
+  return true;
 }
 
 // ---------- recent tabs (Arc's Ctrl+Tab) ----------
@@ -1306,6 +1417,56 @@ async function reconcile() {
   await layoutAll();
   await syncBookmarks(); // pick up changes made on other devices while we were not running
   await syncRetitleScripts();
+  await backupPass(); // a browser that is restarted daily may never see the alarm fire
+}
+
+/**
+ * A window that appeared while we were running: maybe a restored one (Ctrl+Shift+T, or Chrome on
+ * Windows reopening its session while it kept running in the background, so onStartup never
+ * fires). Its tabs have new ids: bind its Favs and Pins again, the way reconcile() does at startup,
+ * before layout() would take the unbound pins for normal tabs and put the divider above them.
+ */
+async function rebindWindow(windowId) {
+  if (!state.ready || !(await isNormalWindow(windowId))) return;
+  const tabs = await windowTabs(windowId);
+  const here = new Set(tabs.map((t) => t.id));
+
+  const pinned = tabs.filter((t) => t.pinned && !favIdOf(t.id)).map((t) => ({ ...t, url: tabUrl(t) }));
+  const favsHere = new Set(tabs.map((t) => favIdOf(t.id)).filter(Boolean));
+  const favs = matchPinsToTabs(state.favs.filter((f) => !favsHere.has(f.id)), pinned);
+  for (const [tabId, favId] of favs.matches) state.tabToFav[tabId] = favId;
+  for (const t of favs.unclaimedTabs) if (canKeep(t)) await bindOrAddFav(t);
+
+  const spaceId = spaceOfWindow(windowId, tabs);
+  state.windowSpace[windowId] = spaceId;
+  const pinsHere = new Set(tabs.map((t) => pinIdOf(t.id)).filter(Boolean));
+  const free = state.pins.filter((p) => p.space === spaceId && !pinsHere.has(p.id));
+  const divider = tabs.find(isDivider);
+  if (divider) {
+    const candidates = tabs
+      .filter((t) => t.index < divider.index && !t.pinned && !isDivider(t) && !pinIdOf(t.id))
+      .map((t) => ({ ...t, url: tabUrl(t) }));
+    const r = matchPinsToTabs(free, candidates);
+    for (const [tabId, pinId] of r.matches) state.tabToPin[tabId] = pinId;
+    for (const t of r.unclaimedTabs) if (canKeep(t)) addPin(t, spaceId);
+  } else {
+    // Same rule as reconcile(): only leading tabs that are exactly an unbound pin's URL.
+    const byUrl = new Map(free.map((p) => [normalizeUrl(p.url), p]));
+    for (const t of tabs.filter((t) => !t.pinned && here.has(t.id))) {
+      if (pinIdOf(t.id)) continue;
+      const pin = byUrl.get(normalizeUrl(tabUrl(t)));
+      if (!pin) break;
+      byUrl.delete(normalizeUrl(tabUrl(t)));
+      state.tabToPin[t.id] = pin.id;
+    }
+  }
+  mergeDuplicateFavs();
+  for (const t of tabs) {
+    if (!(t.groupId > -1) || state.groupMap[t.groupId]) continue;
+    const pin = pinById(pinIdOf(t.id));
+    if (pin?.group && !Object.values(state.groupMap).includes(pin.group)) state.groupMap[t.groupId] = pin.group;
+  }
+  await layout(windowId);
 }
 
 // ---------- bookmarks ----------
@@ -1344,7 +1505,9 @@ async function syncBookmarks() {
       if (root) state.bm.root = root.id;
     }
     if (root) {
+      const adopting = Object.keys(base.nodes ?? {}).length === 0;
       const fx = mergeFromBookmarks(state, root, base, new Set(state.bmTrash), () => crypto.randomUUID());
+      if (adopting) dropUnusedLocalSpaces();
       ensureSpaces();
       await applyBookmarkEffects(fx);
     }
@@ -1359,8 +1522,34 @@ async function syncBookmarks() {
   }
 }
 
+/**
+ * First contact with an existing Pinline folder (new device, reinstall): a local Space that matched
+ * no folder and holds nothing (the "Space 1" made at install) is dropped instead of being written
+ * into the shared folder, where every device would pick it up as a new Space.
+ */
+function dropUnusedLocalSpaces() {
+  const adopted = state.spaces.filter((s) => s.bm);
+  if (!adopted.length) return;
+  const unused = (s) =>
+    !s.bm &&
+    !state.pins.some((p) => p.space === s.id) &&
+    !state.groups.some((g) => g.space === s.id) &&
+    !(state.spaceTabs[s.id] ?? []).length;
+  const drop = new Set(state.spaces.filter(unused).map((s) => s.id));
+  if (!drop.size) return;
+  state.spaces = state.spaces.filter((s) => !drop.has(s.id));
+  for (const id of drop) {
+    delete state.spaceTabs[id];
+    delete state.spaceActive[id];
+  }
+  // Windows that showed it now show the first adopted Space (its pins open via applyBookmarkEffects).
+  for (const [w, id] of Object.entries(state.windowSpace)) if (drop.has(id)) state.windowSpace[w] = adopted[0].id;
+}
+
 /** Make tabs follow what changed in bookmarks. */
 async function applyBookmarkEffects(fx) {
+  // Space folders deleted in bookmarks (maybe on another device): delete those Spaces here too.
+  for (const spaceId of fx.removedSpaces ?? []) await deleteSpace(spaceId, false);
   if (fx.renamed?.length) {
     await syncRetitleScripts();
     for (const id of fx.renamed) {
@@ -1486,15 +1675,22 @@ chrome.runtime.onStartup.addListener(() => {
   run(() => waitForRestore().then(reconcile));
 });
 
+const settlingWindows = new Map(); // windowId -> until when its tabs are being filled in (restore)
 chrome.windows.onCreated.addListener((win) => {
   if (win.type !== 'normal' || win.incognito) return;
-  setTimeout(() => run(() => layout(win.id)), WINDOW_SETTLE_MS);
+  settlingWindows.set(win.id, Date.now() + WINDOW_SETTLE_MS);
+  setTimeout(() => run(async () => {
+    settlingWindows.delete(win.id);
+    await rebindWindow(win.id);
+  }), WINDOW_SETTLE_MS);
 });
 
 chrome.tabs.onCreated.addListener((tab) => {
   run(async () => {
     state.lastSeen[tab.id] ??= Date.now(); // a new tab counts as just used (unless we set its age)
     if (selfCreated.delete(tab.id) || !state.ready) return;
+    // Tabs filling a new (maybe restored) window: rebindWindow() sorts them out once it settles.
+    if (settlingWindows.has(tab.windowId)) return;
     const cur = await getTab(tab.id); // the event's snapshot may be stale by now
     if (!cur || favIdOf(cur.id) || pinIdOf(cur.id)) return;
     tab = cur;
@@ -1600,7 +1796,7 @@ function queueSync(windowId) {
   syncQueued.add(windowId);
   run(async () => {
     syncQueued.delete(windowId);
-    if (state.ready) await syncFromPositions(windowId);
+    if (state.ready && !settlingWindows.has(windowId)) await syncFromPositions(windowId);
   });
 }
 
@@ -1659,7 +1855,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     run(() => sendResponse({ name: (favById(state.tabToFav[id]) ?? pinById(state.tabToPin[id]))?.name ?? null }));
     return true;
   }
-  if (!/^(spaces|items|archive|settings):/.test(msg?.type ?? '')) return;
+  if (!/^(spaces|items|archive|settings|backup):/.test(msg?.type ?? '')) return;
   if (sender.tab && !sender.url?.startsWith(chrome.runtime.getURL(''))) return; // extension pages only
   const windowId = Number.isInteger(msg.windowId) ? msg.windowId : undefined;
   let result;
@@ -1669,6 +1865,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'spaces:delete') await deleteSpace(msg.id);
     if (msg.type === 'spaces:new') await newSpace(windowId, msg.name);
     if (msg.type === 'spaces:suggest') return void (result = { name: defaultSpaceName() });
+    if (msg.type === 'backup:list') return void (result = { backups: await listBackups() });
+    if (msg.type === 'backup:restore') {
+      const ok = Number.isFinite(msg.at) && (await restoreBackup(msg.at));
+      return void (result = { ok, backups: await listBackups() });
+    }
     if (/^(archive|settings):/.test(msg.type)) {
       if (msg.type === 'settings:set' && 'archiveAfterHours' in msg) await setArchiveAfter(msg.archiveAfterHours);
       if (msg.type === 'settings:set' && typeof msg.collapseGroupsOnSwitch === 'boolean') {
@@ -1790,8 +1991,10 @@ chrome.runtime.onMessageExternal?.addListener((raw, sender, sendResponse) => {
 
 chrome.alarms?.onAlarm.addListener((alarm) => {
   if (alarm.name === ARCHIVE_ALARM) run(() => archivePass());
+  if (alarm.name === BACKUP_ALARM) run(() => backupPass());
 });
 run(ensureArchiveAlarm); // alarms may not survive a browser restart
+run(ensureBackupAlarm);
 
 chrome.action.onClicked.addListener((tab) => run(() => togglePin(tab)));
 
@@ -1850,4 +2053,6 @@ globalThis.pinline = {
   clearUnpinned: (windowId) => run(() => clearUnpinned(windowId)),
   openArchived: (id, windowId) => run(() => openArchived(id, windowId)),
   mruBack: (windowId) => run(() => mruBack(windowId)),
+  backupNow: () => run(() => backupPass(Date.now(), true)),
+  restoreBackup: (at) => run(() => restoreBackup(at)),
 };

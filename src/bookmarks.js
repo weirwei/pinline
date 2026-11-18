@@ -7,8 +7,8 @@
 //
 // Three-way merge: `base` is a snapshot of what Pinline last wrote. Anything the bookmarks changed
 // since then wins (rename, reorder, add, delete, move between folders); everything else keeps the
-// local value and is written back by mirrorToBookmarks(). Deleting a whole folder does NOT delete
-// the Space / Favs: the folder is re-created (delete Spaces from the "Manage Spaces" page).
+// local value and is written back by mirrorToBookmarks(). Deleting a Space folder deletes the
+// Space (except the last one); deleting the ⭐ Fav folder keeps the Favs and re-creates the folder.
 
 import { displayOrder, isOpenableUrl, normalizeUrl } from './core.js';
 
@@ -49,7 +49,7 @@ const cleanTitle = (t) => String(t ?? '').replace(/\s+/g, ' ').trim().slice(0, 4
  * @returns effects for the caller to apply to tabs
  */
 export function mergeFromBookmarks(model, root, base, trash, newId) {
-  const fx = { removedFavs: [], addedFavs: [], removedPins: [], addedPins: [], movedPins: [], renamed: [] };
+  const fx = { removedFavs: [], addedFavs: [], removedPins: [], addedPins: [], movedPins: [], renamed: [], removedSpaces: [] };
   model.groups ??= [];
   const nodes = base?.nodes ?? {};
   const adopt = Object.keys(nodes).length === 0;
@@ -125,7 +125,7 @@ export function mergeFromBookmarks(model, root, base, trash, newId) {
   const kids = root.children ?? [];
   const favFolder =
     kids.find((n) => !n.url && n.id === model.bm.fav) ??
-    (adopt || !model.bm.fav ? kids.find((n) => !n.url && n.title === FAV_TITLE && !owner.has(n.id)) : undefined);
+    (adopt || !model.bm.fav ? kids.find((n) => !n.url && n.title === FAV_TITLE && !owner.has(n.id) && !trash.has(n.id)) : undefined);
   model.bm.fav = favFolder?.id;
   if (favFolder) {
     seen.add(favFolder.id);
@@ -187,13 +187,17 @@ export function mergeFromBookmarks(model, root, base, trash, newId) {
 
   // A group folder that is gone: its pins went with it (handled below), the group is dropped later.
   for (const g of model.groups) if (g.bm && !seen.has(g.bm)) g.bm = undefined;
-  // A Space folder that is gone: re-create it (with its pins) instead of deleting anything.
-  for (const s of model.spaces) {
-    if (!s.bm || seen.has(s.bm)) continue;
+  // A Space folder that is gone (deleted here or on another device): the Space is deleted too, by
+  // the caller (it has to switch windows away first). Its pins / groups go with it, not one by one.
+  // The last Space cannot be deleted, so its folder is re-created instead.
+  const gone = model.spaces.filter((s) => s.bm && !seen.has(s.bm));
+  const keepOne = gone.length === model.spaces.length ? gone.shift() : null;
+  for (const s of [keepOne, ...gone].filter(Boolean)) {
     s.bm = undefined;
     for (const p of model.pins) if (p.space === s.id) p.bm = undefined;
     for (const g of model.groups) if (g.space === s.id) g.bm = undefined;
   }
+  fx.removedSpaces = gone.map((s) => s.id);
   // Single bookmarks that are gone (deleted, or moved out of the Pinline folder): un-Fav / unpin.
   for (const f of [...model.favs]) {
     if (f.bm && !seen.has(f.bm)) {

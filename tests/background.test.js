@@ -521,6 +521,107 @@ test('bookmarks: deleting a Space folder re-creates it, the Space is kept', asyn
   assert.equal(bg.__test.state.pins.length, 1);
 });
 
+test('bookmarks: deleting the folder of one of several Spaces deletes that Space (e.g. on another device)', async () => {
+  const { chrome, command, settle, strip, bg } = await setup();
+  await command('toggle-pin', 2);
+  await message(chrome, settle, { type: 'spaces:new', name: '个人', windowId: 1 });
+  await bmSettle(settle);
+  const bm = chrome.bookmarks;
+  assert.deepEqual(bm.titles('Pinline'), ['⭐ Fav', 'Space 1', '个人']);
+  await bm.removeTree(bm.find('Pinline', '个人').id); // the window shows 个人
+  await bmSettle(settle);
+  await bmSettle(settle);
+  const { state } = bg.__test;
+  assert.deepEqual(state.spaces.map((s) => s.name), ['Space 1']);
+  assert.deepEqual(bm.titles('Pinline'), ['⭐ Fav', 'Space 1'], 'not re-created');
+  assert.deepEqual(state.pins.map((p) => p.url), [GH]);
+  assert.ok((await strip(1)).includes(`P(${GH})`) || (await strip(1)).includes(`Pzz(${GH})`), 'window switched back to Space 1');
+
+  await bm.removeTree(bm.find('Pinline', 'Space 1').id); // the last Space stays
+  await bmSettle(settle);
+  assert.deepEqual(state.spaces.map((s) => s.name), ['Space 1']);
+  assert.deepEqual(bm.urls('Pinline', 'Space 1'), [GH]);
+});
+
+// ---------- backups ----------
+
+test('a window restored without onStartup (Ctrl+Shift+T, Windows background mode) keeps its pins', async () => {
+  const { chrome, command, settle, strip, bg } = await setup();
+  await command('toggle-pin', 1);
+  await command('toggle-pin', 2);
+  assert.deepEqual(await strip(1), [`P(${GMAIL})`, `P(${GH})`, '|', DOCS]);
+  const dividerUrl = (await chrome.tabs.query({ windowId: 1 })).find((t) => t.url.startsWith(DIVIDER)).url;
+  await chrome.windows.create({}); // keeps the browser running
+  await sleep(900);
+  await settle();
+  await chrome.windows.remove(1);
+  await settle();
+  // Chrome restores the closed window: same URLs, new tab ids, no onStartup.
+  const w = await chrome.windows.create({ url: GMAIL });
+  await chrome.tabs.create({ windowId: w.id, url: GH, active: false });
+  await chrome.tabs.create({ windowId: w.id, url: dividerUrl, active: false });
+  await chrome.tabs.create({ windowId: w.id, url: DOCS, active: false });
+  await settle();
+  await sleep(900);
+  await settle();
+  assert.deepEqual(await strip(w.id), [`P(${GMAIL})`, `P(${GH})`, '|', DOCS], 'divider stays below the pins');
+  assert.equal(bg.__test.state.pins.length, 2, 'no duplicate pins');
+});
+
+// ---------- backups (3-day) ----------
+
+test('backups: one at start, then at most every 3 days, 2 kept', async () => {
+  const { chrome, command, settle, bg } = await setup();
+  await command('toggle-pin', 2);
+  let { backups } = await chrome.storage.local.get('backups');
+  assert.equal(backups.length, 1, 'first backup right away');
+  const t0 = backups[0].at;
+  await globalThis.pinline.backupNow(); // (forced) a second one
+  chrome.alarms.fire('pinline-backup');
+  await settle();
+  ({ backups } = await chrome.storage.local.get('backups'));
+  assert.equal(backups.length, 2, 'the alarm does nothing before 3 days');
+  const day = 24 * 3600 * 1000;
+  await chrome.storage.local.set({ backups: backups.map((b, i) => ({ ...b, at: t0 - (4 + i) * day })) });
+  chrome.alarms.fire('pinline-backup');
+  await settle();
+  ({ backups } = await chrome.storage.local.get('backups'));
+  assert.equal(backups.length, 2, 'only 2 kept');
+  assert.ok(backups[0].at >= t0 && backups[1].at === t0 - 4 * day, 'newest first, oldest dropped');
+  assert.deepEqual(backups[0].pins.map((p) => p.url), [GH]);
+  assert.ok(bg);
+});
+
+test('backups: restore brings back lost pins, here and in bookmarks', async () => {
+  const { chrome, command, settle, strip, bg } = await setup();
+  await command('toggle-pin', 2);
+  await command('toggle-pin', 3);
+  await bmSettle(settle);
+  await globalThis.pinline.backupNow();
+  await settle();
+  const bm = chrome.bookmarks;
+  // Lost on "another device": both pin bookmarks deleted, and a stray Space folder added.
+  for (const n of [...bm.find('Pinline', 'Space 1').children]) await bm.removeTree(n.id);
+  await bm.create({ parentId: bm.find('Pinline').id, title: 'Space 9' });
+  await bmSettle(settle);
+  const { state } = bg.__test;
+  assert.equal(state.pins.length, 0);
+  assert.equal(state.spaces.length, 2);
+
+  const { backups } = await message(chrome, settle, { type: 'backup:list' });
+  const target = backups.find((b) => b.pins === 2);
+  const res = await message(chrome, settle, { type: 'backup:restore', at: target.at });
+  await bmSettle(settle);
+  assert.equal(res.ok, true);
+  assert.deepEqual(state.spaces.map((s) => s.name), ['Space 1']);
+  assert.deepEqual(state.pins.map((p) => p.url), [GH, DOCS]);
+  assert.deepEqual(bm.titles('Pinline'), ['⭐ Fav', 'Space 1'], 'stray folder removed');
+  assert.deepEqual(bm.urls('Pinline', 'Space 1'), [GH, DOCS]);
+  const s = await strip(1);
+  assert.deepEqual(s.filter((x) => x.startsWith('P')).map((x) => realUrl({ url: x.replace(/^Pz?z?\(|\)$/g, '') })), [GH, DOCS], `pins back: ${s}`);
+  assert.equal(s.filter((x) => x === '|').length, 1);
+});
+
 test('Pinline → bookmarks: new / renamed / deleted Spaces', async () => {
   const { chrome, settle } = await setup();
   const res = await message(chrome, settle, { type: 'spaces:new', name: '个人', windowId: 1 });
@@ -549,11 +650,11 @@ test('fresh install adopts an existing Pinline folder (another device / reinstal
   await fake.settle(bg);
   const { state } = bg.__test;
   assert.deepEqual(state.favs.map((f) => f.url), [GMAIL]);
-  assert.deepEqual(state.spaces.map((s) => s.name), ['Space 1', '工作', '个人'].filter((n) => state.spaces.some((s) => s.name === n)));
-  assert.ok(state.spaces.some((s) => s.name === '工作') && state.spaces.some((s) => s.name === '个人'));
+  assert.deepEqual(state.spaces.map((s) => s.name), ['工作', '个人'], 'the empty Space 1 made at install is dropped');
   assert.deepEqual(state.pins.map((p) => [p.url, state.spaces.find((s) => s.id === p.space).name]), [[GH, '工作']]);
   assert.equal(bm.find('Pinline', '⭐ Fav').children.length, 1, 'nothing duplicated');
   assert.equal(bm.find('Pinline').children.filter((c) => c.title === '工作').length, 1);
+  assert.deepEqual(bm.titles('Pinline'), ['⭐ Fav', '工作', '个人'], 'no Space 1 written into the shared folder');
 });
 
 test('a local unpin is not undone by an unrelated bookmark edit in the same sync', async () => {
